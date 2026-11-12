@@ -8,8 +8,8 @@ $base_url = '/Mora_Bodima';
 
 $host = 'localhost';
 $dbname = 'boarding_rating_db';
-$username = 'root';
-$password = '';
+$username = 'superuser';
+$password = '1234';
 
 try {
     $pdo = new PDO("mysql:host=$host;dbname=$dbname;charset=utf8mb4", $username, $password);
