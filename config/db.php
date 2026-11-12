@@ -4,7 +4,7 @@ if (session_status() === PHP_SESSION_NONE) {
     session_start();
 }
 
-$base_url = '/Mora_Bodima';
+$base_url = '/Mora-Bodima';
 
 $host = 'localhost';
 $dbname = 'boarding_rating_db';
