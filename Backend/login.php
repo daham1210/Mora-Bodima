@@ -13,15 +13,20 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
 
     // 2. Handle Login
     if ($action == 'login') {
-        $email    = trim($_POST['email']);
-        $password = $_POST['password'];
+        $email    = trim($_POST['email'] ?? '');
+        $password = trim($_POST['password'] ?? '');
 
-        $stmt = $pdo->prepare("SELECT * FROM users WHERE user = ?");
-        $stmt->execute([$email]);
-        $user = $stmt->fetch();
+        // 1. Use MySQLi syntax (bind_param -> execute -> get_result -> fetch_assoc)
+        $stmt = $conn->prepare("SELECT * FROM users WHERE email = ?");
+        $stmt->bind_param("s", $email);
+        $stmt->execute();
+        $result = $stmt->get_result();
+        $user   = $result->fetch_assoc();
+        $stmt->close();
 
-        if ($user && (password_verify($password, $user['pass']) || $password == $user['pass'])) {
-            $_SESSION['user_id']   = $user['user'];
+        // 2. Match exact column names from your SQL table: 'User', 'name', 'pass', 'role'
+        if ($user && (password_verify($password, $user['pass']) || $password === $user['pass'])) {
+            $_SESSION['user_id']   = $user['user_id']; // Capital 'U' to match your table!
             $_SESSION['full_name'] = $user['name'];
             $_SESSION['role']      = $user['role'];
 
@@ -32,15 +37,14 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
             exit;
         }
     }
-
     // 3. Handle Registration
     if ($action == 'register') {
         $full_name = trim($_POST['full_name']);
         $email     = trim($_POST['email']);
         $role      = ($_POST['role'] == 'owner') ? 'owner' : 'student';
-        $hashed    = password_hash($_POST['password'], PASSWORD_DEFAULT);
+        $hashed    = $_POST['password'];
 
-        $check = $pdo->prepare("SELECT user_id FROM users WHERE email = ?");
+        $check = $conn->prepare("SELECT * FROM users WHERE email = ?");
         $check->execute([$email]);
 
         if ($check->fetch()) {
@@ -48,7 +52,7 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
             exit;
         }
 
-        $stmt = $pdo->prepare("INSERT INTO users (full_name, email, password_hash, role) VALUES (?, ?, ?, ?)");
+        $stmt = $conn->prepare("INSERT INTO users (name, email, pass, role) VALUES (?, ?, ?, ?)");
         $stmt->execute([$full_name, $email, $hashed, $role]);
 
         header("Location: ../frontend/login.html?msg=Account+created!+Please+sign+in.");
