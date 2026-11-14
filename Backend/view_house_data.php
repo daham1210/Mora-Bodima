@@ -110,8 +110,8 @@ function vh_rating_value($key)
 
 // Does the reviews table have the extra Cleanliness / Safety columns?
 // (Keeps this file working even if database.sql only has overall_rating.)
-$hasCategoryRatings = (bool)$pdo->query("SHOW COLUMNS FROM reviews LIKE 'cleanliness_rating'")->fetch()
-                   && (bool)$pdo->query("SHOW COLUMNS FROM reviews LIKE 'safety_rating'")->fetch();
+$hasCategoryRatings = (bool)$conn->query("SHOW COLUMNS FROM reviews LIKE 'cleanliness_rating'")->fetch()
+                   && (bool)$conn->query("SHOW COLUMNS FROM reviews LIKE 'safety_rating'")->fetch();
 
 $isLoggedIn = isset($_SESSION['user_id']);
 $userId     = $isLoggedIn ? (int)$_SESSION['user_id'] : 0;
@@ -131,7 +131,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     }
 
     // 2) The house must exist and be approved
-    $stmt = $pdo->prepare("SELECT house_id, owner_id, status FROM boarding_houses WHERE house_id = ?");
+    $stmt = $conn->prepare("SELECT house_id, owner_id, status FROM boarding_houses WHERE house_id = ?");
     $stmt->execute([$house_id]);
     $house = $stmt->fetch();
 
@@ -161,51 +161,51 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     }
 
     try {
-        $pdo->beginTransaction();
+        $conn->beginTransaction();
 
         // 5) Has this user already reviewed this house?
-        $stmt = $pdo->prepare("SELECT review_id FROM reviews WHERE house_id = ? AND user_id = ? LIMIT 1");
+        $stmt = $conn->prepare("SELECT review_id FROM reviews WHERE house_id = ? AND user_id = ? LIMIT 1");
         $stmt->execute([$house_id, $userId]);
         $existing = $stmt->fetch();
 
         if ($existing) {
             // UPDATE the existing review (one review per student per house)
             if ($hasCategoryRatings) {
-                $stmt = $pdo->prepare("UPDATE reviews
+                $stmt = $conn->prepare("UPDATE reviews
                                        SET overall_rating = ?, cleanliness_rating = ?, safety_rating = ?, comment = ?
                                        WHERE review_id = ?");
                 $stmt->execute([$overall, $cleanliness, $safety, $comment, $existing['review_id']]);
             } else {
-                $stmt = $pdo->prepare("UPDATE reviews SET overall_rating = ?, comment = ? WHERE review_id = ?");
+                $stmt = $conn->prepare("UPDATE reviews SET overall_rating = ?, comment = ? WHERE review_id = ?");
                 $stmt->execute([$overall, $comment, $existing['review_id']]);
             }
             $message = "Your review has been updated. Thank you!";
         } else {
             // INSERT a brand-new review
             if ($hasCategoryRatings) {
-                $stmt = $pdo->prepare("INSERT INTO reviews (house_id, user_id, overall_rating, cleanliness_rating, safety_rating, comment)
+                $stmt = $conn->prepare("INSERT INTO reviews (house_id, user_id, overall_rating, cleanliness_rating, safety_rating, comment)
                                        VALUES (?, ?, ?, ?, ?, ?)");
                 $stmt->execute([$house_id, $userId, $overall, $cleanliness, $safety, $comment]);
             } else {
-                $stmt = $pdo->prepare("INSERT INTO reviews (house_id, user_id, overall_rating, comment) VALUES (?, ?, ?, ?)");
+                $stmt = $conn->prepare("INSERT INTO reviews (house_id, user_id, overall_rating, comment) VALUES (?, ?, ?, ?)");
                 $stmt->execute([$house_id, $userId, $overall, $comment]);
             }
             $message = "Your review was posted successfully. Thank you!";
         }
 
         // 6) Recalculate the average rating and total number of reviews in MySQL
-        $stmt = $pdo->prepare("SELECT AVG(overall_rating) AS avg_r, COUNT(*) AS total_r FROM reviews WHERE house_id = ?");
+        $stmt = $conn->prepare("SELECT AVG(overall_rating) AS avg_r, COUNT(*) AS total_r FROM reviews WHERE house_id = ?");
         $stmt->execute([$house_id]);
         $stats = $stmt->fetch();
 
         // 7) Save the new numbers on the boarding house row
-        $stmt = $pdo->prepare("UPDATE boarding_houses SET avg_rating = ?, total_reviews = ? WHERE house_id = ?");
+        $stmt = $conn->prepare("UPDATE boarding_houses SET avg_rating = ?, total_reviews = ? WHERE house_id = ?");
         $stmt->execute([round((float)($stats['avg_r'] ?? 0), 2), (int)$stats['total_r'], $house_id]);
 
-        $pdo->commit();
+        $conn->commit();
     } catch (PDOException $e) {
-        if ($pdo->inTransaction()) {
-            $pdo->rollBack();
+        if ($conn->inTransaction()) {
+            $conn->rollBack();
         }
         vh_redirect($backUrl . "&err=" . urlencode("Could not save your review. Please try again."));
     }
@@ -326,7 +326,7 @@ if ($house_id <= 0) {
 }
 
 /* ---------- Query (a): house details + owner name & email ---------- */
-$stmt = $pdo->prepare("SELECT b.*, u.full_name AS owner_name, u.email AS owner_email
+$stmt = $conn->prepare("SELECT b.*, u.full_name AS owner_name, u.email AS owner_email
                        FROM boarding_houses b
                        JOIN users u ON b.owner_id = u.user_id
                        WHERE b.house_id = ?");
@@ -346,12 +346,12 @@ if ($house['status'] !== 'approved' && !$isOwner && !$isAdmin) {
 }
 
 /* ---------- Query (b): all photos for the gallery ---------- */
-$stmt = $pdo->prepare("SELECT image_id, image_path FROM house_images WHERE house_id = ? ORDER BY image_id ASC");
+$stmt = $conn->prepare("SELECT image_id, image_path FROM house_images WHERE house_id = ? ORDER BY image_id ASC");
 $stmt->execute([$house_id]);
 $images = $stmt->fetchAll();
 
 /* ---------- Query (c): all reviews + reviewer names (newest first) ---------- */
-$stmt = $pdo->prepare("SELECT r.*, u.full_name AS reviewer_name, u.role AS reviewer_role
+$stmt = $conn->prepare("SELECT r.*, u.full_name AS reviewer_name, u.role AS reviewer_role
                        FROM reviews r
                        JOIN users u ON r.user_id = u.user_id
                        WHERE r.house_id = ?
@@ -363,7 +363,7 @@ $reviews = $stmt->fetchAll();
 $avgSql = $hasCategoryRatings
     ? "SELECT AVG(overall_rating) AS avg_overall, AVG(cleanliness_rating) AS avg_clean, AVG(safety_rating) AS avg_safety, COUNT(*) AS total FROM reviews WHERE house_id = ?"
     : "SELECT AVG(overall_rating) AS avg_overall, COUNT(*) AS total FROM reviews WHERE house_id = ?";
-$stmt = $pdo->prepare($avgSql);
+$stmt = $conn->prepare($avgSql);
 $stmt->execute([$house_id]);
 $avg = $stmt->fetch();
 
