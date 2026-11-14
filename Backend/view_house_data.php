@@ -2,7 +2,7 @@
 /**
  * ============================================================================
  *  MoraBodima — backend/view_house_data.php
- *  File 17: House Details Reader & Review Submission Handler
+ *  File 17: House Details Reader & Review Submission Handler (MySQLi)
  * ============================================================================
  *
  *  This file does TWO jobs:
@@ -16,26 +16,26 @@
  *
  *   2. GET   (called by app.js:  fetch('../backend/view_house_data.php?id=X'))
  *      -> Runs the 3 main SELECT queries:
- *           (a) boarding house JOIN users   (house details + owner name/email)
- *           (b) house_images                (photo gallery)
- *           (c) reviews JOIN users          (each review + reviewer name)
+ *          (a) boarding house JOIN users   (house details + owner name/email)
+ *          (b) house_images                (photo gallery)
+ *          (c) reviews JOIN users          (each review + reviewer name)
  *      -> Echoes an HTML fragment that app.js injects into
  *         <div id="houseDetailsContainer"> on frontend/view_house.html
  *
- *  IMPORTANT: This output is inserted with element.innerHTML, so <script> tags
- *  would NOT run. That is why the star-rating picker is pure CSS (radio
- *  buttons) and the gallery uses a small inline onclick="" attribute.
- *
  *  Key functions for the viva:
- *    $pdo->prepare() + execute()  -> prevents SQL injection
- *    AVG() / COUNT(*)             -> rating aggregation in MySQL
- *    htmlspecialchars()           -> blocks XSS
- *    nl2br()                      -> keeps line breaks in descriptions/reviews
- *    beginTransaction()/commit()  -> review save + rating update happen together
+ *    $conn->prepare() + bind_param() + execute() -> prevents SQL injection
+ *    AVG() / COUNT(*)                            -> rating aggregation in MySQL
+ *    htmlspecialchars()                          -> blocks XSS
+ *    nl2br()                                     -> keeps line breaks in text
+ *    begin_transaction() / commit()              -> atomic review + rating save
  * ============================================================================
  */
 
 require_once __DIR__ . '/config/db_con.php';
+
+if (session_status() === PHP_SESSION_NONE) {
+    session_start();
+}
 
 /* ----------------------------------------------------------------------------
  *  Small helper functions
@@ -55,10 +55,6 @@ function vh_redirect($url)
 }
 
 // Convert a stored image_path into a URL usable from frontend/view_house.html
-//   "uploads/123_room.jpg"        -> "../uploads/123_room.jpg"
-//   "/Mora-Bodima/uploads/x.jpg"  -> unchanged (already absolute)
-//   "data:image/jpeg;base64,..."  -> unchanged (Base64 image)
-//   "https://..."                 -> unchanged (external image)
 function vh_image_src($path)
 {
     $path = trim((string)$path);
@@ -109,9 +105,9 @@ function vh_rating_value($key)
 }
 
 // Does the reviews table have the extra Cleanliness / Safety columns?
-// (Keeps this file working even if database.sql only has overall_rating.)
-$hasCategoryRatings = (bool)$conn->query("SHOW COLUMNS FROM reviews LIKE 'cleanliness_rating'")->fetch()
-                   && (bool)$conn->query("SHOW COLUMNS FROM reviews LIKE 'safety_rating'")->fetch();
+$colClean  = $conn->query("SHOW COLUMNS FROM reviews LIKE 'cleanliness_rating'");
+$colSafety = $conn->query("SHOW COLUMNS FROM reviews LIKE 'safety_rating'");
+$hasCategoryRatings = ($colClean && $colClean->num_rows > 0) && ($colSafety && $colSafety->num_rows > 0);
 
 $isLoggedIn = isset($_SESSION['user_id']);
 $userId     = $isLoggedIn ? (int)$_SESSION['user_id'] : 0;
@@ -132,8 +128,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
     // 2) The house must exist and be approved
     $stmt = $conn->prepare("SELECT house_id, owner_id, status FROM boarding_houses WHERE house_id = ?");
-    $stmt->execute([$house_id]);
-    $house = $stmt->fetch();
+    $stmt->bind_param("i", $house_id);
+    $stmt->execute();
+    $house = $stmt->get_result()->fetch_assoc();
+    $stmt->close();
 
     if (!$house || $house['status'] !== 'approved') {
         vh_redirect("../frontend/index.html?err=" . urlencode("That boarding house is not available for reviews."));
@@ -160,52 +158,68 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $comment = mb_substr($comment, 0, 2000);
     }
 
+    $inTransaction = false;
     try {
-        $conn->beginTransaction();
+        $conn->begin_transaction();
+        $inTransaction = true;
 
         // 5) Has this user already reviewed this house?
         $stmt = $conn->prepare("SELECT review_id FROM reviews WHERE house_id = ? AND user_id = ? LIMIT 1");
-        $stmt->execute([$house_id, $userId]);
-        $existing = $stmt->fetch();
+        $stmt->bind_param("ii", $house_id, $userId);
+        $stmt->execute();
+        $existing = $stmt->get_result()->fetch_assoc();
+        $stmt->close();
 
         if ($existing) {
             // UPDATE the existing review (one review per student per house)
+            $revId = (int)$existing['review_id'];
             if ($hasCategoryRatings) {
                 $stmt = $conn->prepare("UPDATE reviews
-                                       SET overall_rating = ?, cleanliness_rating = ?, safety_rating = ?, comment = ?
-                                       WHERE review_id = ?");
-                $stmt->execute([$overall, $cleanliness, $safety, $comment, $existing['review_id']]);
+                                        SET overall_rating = ?, cleanliness_rating = ?, safety_rating = ?, comment = ?
+                                        WHERE review_id = ?");
+                $stmt->bind_param("iiisi", $overall, $cleanliness, $safety, $comment, $revId);
             } else {
                 $stmt = $conn->prepare("UPDATE reviews SET overall_rating = ?, comment = ? WHERE review_id = ?");
-                $stmt->execute([$overall, $comment, $existing['review_id']]);
+                $stmt->bind_param("isi", $overall, $comment, $revId);
             }
+            $stmt->execute();
+            $stmt->close();
             $message = "Your review has been updated. Thank you!";
         } else {
             // INSERT a brand-new review
             if ($hasCategoryRatings) {
                 $stmt = $conn->prepare("INSERT INTO reviews (house_id, user_id, overall_rating, cleanliness_rating, safety_rating, comment)
-                                       VALUES (?, ?, ?, ?, ?, ?)");
-                $stmt->execute([$house_id, $userId, $overall, $cleanliness, $safety, $comment]);
+                                        VALUES (?, ?, ?, ?, ?, ?)");
+                $stmt->bind_param("iiiiis", $house_id, $userId, $overall, $cleanliness, $safety, $comment);
             } else {
                 $stmt = $conn->prepare("INSERT INTO reviews (house_id, user_id, overall_rating, comment) VALUES (?, ?, ?, ?)");
-                $stmt->execute([$house_id, $userId, $overall, $comment]);
+                $stmt->bind_param("iiis", $house_id, $userId, $overall, $comment);
             }
+            $stmt->execute();
+            $stmt->close();
             $message = "Your review was posted successfully. Thank you!";
         }
 
         // 6) Recalculate the average rating and total number of reviews in MySQL
         $stmt = $conn->prepare("SELECT AVG(overall_rating) AS avg_r, COUNT(*) AS total_r FROM reviews WHERE house_id = ?");
-        $stmt->execute([$house_id]);
-        $stats = $stmt->fetch();
+        $stmt->bind_param("i", $house_id);
+        $stmt->execute();
+        $stats = $stmt->get_result()->fetch_assoc();
+        $stmt->close();
 
         // 7) Save the new numbers on the boarding house row
+        $newAvg   = round((float)($stats['avg_r'] ?? 0), 2);
+        $newTotal = (int)($stats['total_r'] ?? 0);
         $stmt = $conn->prepare("UPDATE boarding_houses SET avg_rating = ?, total_reviews = ? WHERE house_id = ?");
-        $stmt->execute([round((float)($stats['avg_r'] ?? 0), 2), (int)$stats['total_r'], $house_id]);
+        $stmt->bind_param("dii", $newAvg, $newTotal, $house_id);
+        $stmt->execute();
+        $stmt->close();
 
         $conn->commit();
-    } catch (PDOException $e) {
-        if ($conn->inTransaction()) {
-            $conn->rollBack();
+        $inTransaction = false;
+    } catch (Throwable $e) {
+        if ($inTransaction) {
+            $conn->rollback();
         }
         vh_redirect($backUrl . "&err=" . urlencode("Could not save your review. Please try again."));
     }
@@ -218,10 +232,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
  * ========================================================================= */
 
 $house_id = isset($_GET['id']) ? (int)$_GET['id'] : 0;
-
-// Styles for this fragment. Everything is prefixed with "vh-" so it never
-// clashes with style.css. Colours follow the site theme:
-// navy #0f172a, royal blue #2563eb, white cards.
 ?>
 <style>
     .vh-wrap{color:#0f172a}
@@ -326,12 +336,14 @@ if ($house_id <= 0) {
 }
 
 /* ---------- Query (a): house details + owner name & email ---------- */
-$stmt = $conn->prepare("SELECT b.*, u.full_name AS owner_name, u.email AS owner_email
-                       FROM boarding_houses b
-                       JOIN users u ON b.owner_id = u.user_id
-                       WHERE b.house_id = ?");
-$stmt->execute([$house_id]);
-$house = $stmt->fetch();
+$stmt = $conn->prepare("SELECT b.*, u.name AS owner_name, u.email AS owner_email
+                        FROM boarding_houses b
+                        JOIN users u ON b.owner_id = u.user_id
+                        WHERE b.house_id = ?");
+$stmt->bind_param("i", $house_id);
+$stmt->execute();
+$house = $stmt->get_result()->fetch_assoc();
+$stmt->close();
 
 if (!$house) {
     vh_error_card('🏚️', 'Boarding house not found', 'This listing may have been removed by the owner or an administrator.');
@@ -347,31 +359,37 @@ if ($house['status'] !== 'approved' && !$isOwner && !$isAdmin) {
 
 /* ---------- Query (b): all photos for the gallery ---------- */
 $stmt = $conn->prepare("SELECT image_id, image_path FROM house_images WHERE house_id = ? ORDER BY image_id ASC");
-$stmt->execute([$house_id]);
-$images = $stmt->fetchAll();
+$stmt->bind_param("i", $house_id);
+$stmt->execute();
+$images = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
+$stmt->close();
 
 /* ---------- Query (c): all reviews + reviewer names (newest first) ---------- */
-$stmt = $conn->prepare("SELECT r.*, u.full_name AS reviewer_name, u.role AS reviewer_role
-                       FROM reviews r
-                       JOIN users u ON r.user_id = u.user_id
-                       WHERE r.house_id = ?
-                       ORDER BY r.created_at DESC, r.review_id DESC");
-$stmt->execute([$house_id]);
-$reviews = $stmt->fetchAll();
+$stmt = $conn->prepare("SELECT r.*, u.name AS reviewer_name, u.role AS reviewer_role
+                        FROM reviews r
+                        JOIN users u ON r.user_id = u.user_id
+                        WHERE r.house_id = ?
+                        ORDER BY r.created_at DESC, r.review_id DESC");
+$stmt->bind_param("i", $house_id);
+$stmt->execute();
+$reviews = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
+$stmt->close();
 
 /* ---------- Rating breakdown (category averages) ---------- */
 $avgSql = $hasCategoryRatings
     ? "SELECT AVG(overall_rating) AS avg_overall, AVG(cleanliness_rating) AS avg_clean, AVG(safety_rating) AS avg_safety, COUNT(*) AS total FROM reviews WHERE house_id = ?"
     : "SELECT AVG(overall_rating) AS avg_overall, COUNT(*) AS total FROM reviews WHERE house_id = ?";
 $stmt = $conn->prepare($avgSql);
-$stmt->execute([$house_id]);
-$avg = $stmt->fetch();
+$stmt->bind_param("i", $house_id);
+$stmt->execute();
+$avg = $stmt->get_result()->fetch_assoc();
+$stmt->close();
 
 $avgOverall   = (float)($avg['avg_overall'] ?? 0);
-$totalReviews = (int)$avg['total'];
+$totalReviews = (int)($avg['total'] ?? 0);
 $breakdown    = ['⭐ Overall Experience' => $avgOverall];
 if ($hasCategoryRatings) {
-    $breakdown['🧹 Cleanliness']     = (float)($avg['avg_clean'] ?? 0);
+    $breakdown['🧹 Cleanliness']       = (float)($avg['avg_clean'] ?? 0);
     $breakdown['🔒 Safety & Security'] = (float)($avg['avg_safety'] ?? 0);
 }
 
@@ -391,9 +409,9 @@ $amenities = array_filter(array_map('trim', explode(',', (string)$house['ameniti
 $mapLink  = trim((string)$house['google_maps_link']);
 $embedUrl = '';
 if ($mapLink !== '' && preg_match('/src=["\']([^"\']+)["\']/i', $mapLink, $m)) {
-    $embedUrl = $m[1];                                   // owner pasted the full <iframe> code
+    $embedUrl = $m[1];
 } elseif ($mapLink !== '' && (stripos($mapLink, 'output=embed') !== false || stripos($mapLink, '/maps/embed') !== false)) {
-    $embedUrl = $mapLink;                                // already an embed link
+    $embedUrl = $mapLink;
 }
 if ($embedUrl === '' || !preg_match('#^https://#i', $embedUrl)) {
     $embedUrl = 'https://maps.google.com/maps?q=' . urlencode($house['address'] . ', Sri Lanka') . '&z=15&output=embed';
@@ -552,7 +570,6 @@ $status = (string)$house['status'];
 
         <?php else: ?>
             <?php
-            // Fields shown in the form. If the DB only has overall_rating, just show one.
             $ratingFields = ['overall_rating' => 'Overall Experience'];
             if ($hasCategoryRatings) {
                 $ratingFields['cleanliness_rating'] = 'Cleanliness';
@@ -567,8 +584,6 @@ $status = (string)$house['status'];
                         <?php $current = $myReview ? (int)($myReview[$field] ?? 0) : 0; ?>
                         <div>
                             <span class="vh-label"><?= $label ?></span>
-                            <!-- Stars are listed 5 → 1 and shown with row-reverse, so
-                                 "input:checked ~ label" highlights the chosen star and every star before it -->
                             <div class="vh-rate">
                                 <?php for ($s = 5; $s >= 1; $s--): ?>
                                     <input type="radio" id="<?= $field . $s ?>" name="<?= $field ?>" value="<?= $s ?>"
