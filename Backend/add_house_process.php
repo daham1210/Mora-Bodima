@@ -1,14 +1,14 @@
 <?php
 // backend/add_house_process.php
-// Create Listing & Image Upload Handler (receives POST from frontend/add_house.html)
+// Create Listing & Image Upload Handler (MySQLi)
 
 if (session_status() === PHP_SESSION_NONE) {
     session_start();
 }
 
-require_once '/config/db.php';
+require_once __DIR__ . '/config/db_con.php';
 
-$base_url = $base_url ?? '..';
+$base_url = '..';
 
 // Helper: redirect back to the form with an error message
 function back_with_error($msg) {
@@ -92,32 +92,41 @@ if (function_exists('mime_content_type')) {
 if (!in_array($ext, $allowedExt, true) || !in_array($mime, $allowedMime, true)) {
     back_with_error("Only JPG, PNG, GIF or WEBP images are allowed.");
 }
-if ($_FILES[$fileKey]['size'] > 5 * 1024 * 1024) {
+
+// 5242880 bytes = 5 MB
+if ($_FILES[$fileKey]['size'] > 5242880) {
     back_with_error("Image is too large (max 5 MB).");
 }
 
-$destination = null;
+$distanceVal   = (float)$distance_km;
+$rentVal       = (float)$monthly_rent;
+$destination   = null;
+$inTransaction = false;
 
 try {
     // Start transaction so DB records only save if the image upload succeeds
-    $pdo->beginTransaction();
+    $conn->begin_transaction();
+    $inTransaction = true;
 
     // 5. Insert the boarding house
     $status = ($_SESSION['role'] === 'admin') ? 'approved' : 'pending';
 
-    $stmt = $pdo->prepare(
+    $stmt = $conn->prepare(
         "INSERT INTO boarding_houses
             (owner_id, title, address, google_maps_link, distance_km, monthly_rent,
              gender_type, amenities, description, status)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
     );
-    $stmt->execute([
-        $owner_id, $title, $address, $google_maps_link, $distance_km, $monthly_rent,
+    $stmt->bind_param(
+        "isssddssss",
+        $owner_id, $title, $address, $google_maps_link, $distanceVal, $rentVal,
         $gender_type, $amenities, $description, $status
-    ]);
+    );
+    $stmt->execute();
+    $stmt->close();
 
     // 6. Get the new house_id
-    $house_id = (int)$pdo->lastInsertId();
+    $house_id = (int)$conn->insert_id;
 
     // 7. Ensure /uploads/ folder exists
     $uploadDir = __DIR__ . '/../uploads/';
@@ -134,11 +143,14 @@ try {
         throw new RuntimeException("Photo upload failed.");
     }
 
-    $imgStmt = $pdo->prepare("INSERT INTO house_images (house_id, image_path) VALUES (?, ?)");
-    $imgStmt->execute([$house_id, $newFileName]);
+    $imgStmt = $conn->prepare("INSERT INTO house_images (house_id, image_path) VALUES (?, ?)");
+    $imgStmt->bind_param("is", $house_id, $newFileName);
+    $imgStmt->execute();
+    $imgStmt->close();
 
     // Commit both database inserts together
-    $pdo->commit();
+    $conn->commit();
+    $inTransaction = false;
 
     // 9. Success
     $msg = ($status === 'approved')
@@ -148,11 +160,11 @@ try {
     exit;
 
 } catch (Throwable $e) {
-    if ($pdo->inTransaction()) {
-        $pdo->rollBack();
+    if ($inTransaction) {
+        $conn->rollback();
     }
     if ($destination !== null && file_exists($destination)) {
-        unlink($destination);
+        @unlink($destination);
     }
     error_log("Add house error: " . $e->getMessage());
     back_with_error("Could not save the boarding house. Please try again.");

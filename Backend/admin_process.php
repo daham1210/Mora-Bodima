@@ -1,46 +1,42 @@
 <?php
-/**
- * ============================================================================
- *  MoraBodima — backend/admin_process.php
- *  File 19: Admin Moderation & Metrics Controller
- * ============================================================================
- *
- *  Only users with $_SESSION['role'] == 'admin' can use this file.
- *
- *   1. POST  (Approve / Reject / Delete buttons in the moderation table)
- *      action = "approved"  -> UPDATE boarding_houses SET status = 'approved'
- *      action = "rejected"  -> UPDATE boarding_houses SET status = 'rejected'
- *      action = "delete"    -> DELETE FROM boarding_houses
- *                              (ON DELETE CASCADE also removes its photos & reviews)
- *      Then redirects to frontend/admin.html?msg=...
- *
- *   2. GET   (called by app.js:  fetch('../backend/admin_process.php'))
- *      -> Counts total users, listings and reviews with ->fetchColumn()
- *      -> Loads every boarding house JOIN users (owner name/email)
- *      -> Echoes the 3 KPI summary cards + the moderation table as HTML,
- *         which app.js injects into <div id="adminContainer"> on admin.html
- *
- *  Key functions for the viva:
- *    $pdo->query("SELECT COUNT(*) ...")->fetchColumn()  -> returns one number
- *    $pdo->prepare() + execute()                        -> safe UPDATE / DELETE
- *    ON DELETE CASCADE (database.sql)                   -> auto-cleans child rows
- *    htmlspecialchars()                                 -> blocks XSS in titles/names
- * ============================================================================
- */
+// backend/admin_process.php
+// Admin Moderation & Metrics Controller (MySQLi)
 
-require_once '/config/db.php';
+require_once __DIR__ . '/config/db_con.php';
 
-// Escape any value before printing it inside HTML (prevents XSS)
+if (session_status() === PHP_SESSION_NONE) {
+    session_start();
+}
+
 function adm_e($value)
 {
     return htmlspecialchars((string)$value, ENT_QUOTES, 'UTF-8');
 }
 
-// Redirect the browser back to the admin page with a status message
 function adm_redirect($type, $text)
 {
     header("Location: ../frontend/admin.html?$type=" . urlencode($text));
     exit;
+}
+
+// Helper: run a COUNT(*) query and return the integer result
+function adm_count($conn, $sql)
+{
+    $res = $conn->query($sql);
+    $row = $res ? $res->fetch_row() : null;
+    return (int)($row[0] ?? 0);
+}
+
+// Helper: return key => value pairs from a 2-column GROUP BY query
+function adm_key_pair($conn, $sql)
+{
+    $pairs = [];
+    if ($res = $conn->query($sql)) {
+        while ($row = $res->fetch_row()) {
+            $pairs[$row[0]] = (int)$row[1];
+        }
+    }
+    return $pairs;
 }
 
 $isAdmin = isset($_SESSION['user_id']) && ($_SESSION['role'] ?? '') === 'admin';
@@ -50,7 +46,6 @@ $isAdmin = isset($_SESSION['user_id']) && ($_SESSION['role'] ?? '') === 'admin';
  * ========================================================================= */
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
-    // Block anyone who is not an admin
     if (!$isAdmin) {
         header("Location: ../frontend/login.html?err=" . urlencode("Admin access only. Please log in as an administrator."));
         exit;
@@ -60,29 +55,53 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     $action   = $_POST['action'] ?? '';
 
     // Make sure the listing exists before changing it
-    $stmt = $pdo->prepare("SELECT house_id FROM boarding_houses WHERE house_id = ?");
-    $stmt->execute([$house_id]);
-    if (!$stmt->fetch()) {
+    $stmt = $conn->prepare("SELECT house_id FROM boarding_houses WHERE house_id = ?");
+    $stmt->bind_param("i", $house_id);
+    $stmt->execute();
+    $exists = $stmt->get_result()->fetch_assoc();
+    $stmt->close();
+
+    if (!$exists) {
         adm_redirect('err', "Listing #$house_id was not found. It may already be deleted.");
     }
 
     try {
         if ($action === 'approved' || $action === 'rejected') {
-            // Change visibility status (approved = public, rejected = hidden)
-            $stmt = $pdo->prepare("UPDATE boarding_houses SET status = ? WHERE house_id = ?");
-            $stmt->execute([$action, $house_id]);
+            $stmt = $conn->prepare("UPDATE boarding_houses SET status = ? WHERE house_id = ?");
+            $stmt->bind_param("si", $action, $house_id);
+            $stmt->execute();
+            $stmt->close();
             adm_redirect('msg', "Listing #$house_id has been " . $action . ".");
 
         } elseif ($action === 'delete') {
-            // Delete the listing. MySQL's ON DELETE CASCADE removes its images and reviews too.
-            $stmt = $pdo->prepare("DELETE FROM boarding_houses WHERE house_id = ?");
-            $stmt->execute([$house_id]);
+            // Remove uploaded image files from disk before deleting the house row
+            $imgStmt = $conn->prepare("SELECT image_path FROM house_images WHERE house_id = ?");
+            $imgStmt->bind_param("i", $house_id);
+            $imgStmt->execute();
+            $imgs = $imgStmt->get_result()->fetch_all(MYSQLI_ASSOC);
+            $imgStmt->close();
+
+            foreach ($imgs as $img) {
+                $path = (string)$img['image_path'];
+                if (!preg_match('#^(data:image/|https?://)#i', $path)) {
+                    $file = __DIR__ . '/../uploads/' . basename($path);
+                    if (is_file($file)) {
+                        @unlink($file);
+                    }
+                }
+            }
+
+            // ON DELETE CASCADE removes its house_images and reviews rows automatically
+            $stmt = $conn->prepare("DELETE FROM boarding_houses WHERE house_id = ?");
+            $stmt->bind_param("i", $house_id);
+            $stmt->execute();
+            $stmt->close();
             adm_redirect('msg', "Listing #$house_id and all its photos and reviews were permanently deleted.");
 
         } else {
             adm_redirect('err', "Unknown admin action.");
         }
-    } catch (PDOException $e) {
+    } catch (Throwable $e) {
         adm_redirect('err', "Database error. The action could not be completed.");
     }
 }
@@ -91,7 +110,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
  *  PART 2 — GET: Dashboard (KPI cards + moderation table)
  * ========================================================================= */
 
-// Not an admin? Show an access-denied message and stop.
 if (!$isAdmin) {
     echo '<div style="background:#fff;border-radius:16px;padding:44px 20px;text-align:center;color:#0f172a;box-shadow:0 10px 30px rgba(0,0,0,.25)">'
        . '<div style="font-size:50px;margin-bottom:10px">🔒</div>'
@@ -102,23 +120,23 @@ if (!$isAdmin) {
     exit;
 }
 
-/* ---------- Summary metrics: fetchColumn() returns the single COUNT value ---------- */
-$totalUsers   = (int)$pdo->query("SELECT COUNT(*) FROM users")->fetchColumn();
-$totalHouses  = (int)$pdo->query("SELECT COUNT(*) FROM boarding_houses")->fetchColumn();
-$totalReviews = (int)$pdo->query("SELECT COUNT(*) FROM reviews")->fetchColumn();
+/* ---------- Summary metrics ---------- */
+$totalUsers   = adm_count($conn, "SELECT COUNT(*) FROM users");
+$totalHouses  = adm_count($conn, "SELECT COUNT(*) FROM boarding_houses");
+$totalReviews = adm_count($conn, "SELECT COUNT(*) FROM reviews");
 
-// Extra detail for the cards: listings per status and users per role
-$statusCounts = $pdo->query("SELECT status, COUNT(*) FROM boarding_houses GROUP BY status")->fetchAll(PDO::FETCH_KEY_PAIR);
-$roleCounts   = $pdo->query("SELECT role, COUNT(*) FROM users GROUP BY role")->fetchAll(PDO::FETCH_KEY_PAIR);
+$statusCounts = adm_key_pair($conn, "SELECT status, COUNT(*) FROM boarding_houses GROUP BY status");
+$roleCounts   = adm_key_pair($conn, "SELECT role, COUNT(*) FROM users GROUP BY role");
 $pendingCount = (int)($statusCounts['pending'] ?? 0);
 
 /* ---------- All boarding houses + owner details (pending ones first) ---------- */
-$houses = $pdo->query("SELECT b.house_id, b.title, b.address, b.monthly_rent, b.gender_type,
-                              b.avg_rating, b.total_reviews, b.status,
-                              u.full_name AS owner_name, u.email AS owner_email
-                       FROM boarding_houses b
-                       JOIN users u ON b.owner_id = u.user_id
-                       ORDER BY FIELD(b.status, 'pending', 'approved', 'rejected'), b.house_id DESC")->fetchAll();
+$resHouses = $conn->query("SELECT b.house_id, b.title, b.address, b.monthly_rent, b.gender_type,
+                                  b.avg_rating, b.total_reviews, b.status,
+                                  u.name AS owner_name, u.email AS owner_email
+                           FROM boarding_houses b
+                           JOIN users u ON b.owner_id = u.user_id
+                           ORDER BY FIELD(b.status, 'pending', 'approved', 'rejected'), b.house_id DESC");
+$houses = $resHouses ? $resHouses->fetch_all(MYSQLI_ASSOC) : [];
 ?>
 <style>
     .adm-wrap{color:#0f172a}
@@ -248,7 +266,6 @@ $houses = $pdo->query("SELECT b.house_id, b.title, b.address, b.monthly_rent, b.
                             $id     = (int)$h['house_id'];
                             $status = (string)$h['status'];
 
-                            // Gender badge (male / female / mixed)
                             $g = strtolower((string)$h['gender_type']);
                             if (strpos($g, 'female') !== false || strpos($g, 'girl') !== false) {
                                 $genderClass = 'badge-female';

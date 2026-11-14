@@ -1,6 +1,6 @@
 <?php
 // backend/edit_house_process.php
-// Update Listing & Delete Photo Handler
+// Update Listing & Delete Photo Handler (MySQLi)
 //   GET  ?id=X                      -> outputs the pre-filled edit form (fetched by app.js)
 //   GET  ?delete_img=Y&id=X         -> deletes one photo, redirects back to edit_house.html
 //   POST (hidden house_id + fields) -> updates listing, adds new photo, redirects to view_house.html
@@ -9,9 +9,10 @@ if (session_status() === PHP_SESSION_NONE) {
     session_start();
 }
 
-require_once '/config/db.php';
+require_once __DIR__ . '/config/db_con.php';
 
-$base_url = $base_url ?? '..';
+// Always use relative path '..' so subfolder names like "Web Project" never break links
+$base_url = '..';
 
 // Redirect helper (used by delete / update actions)
 function go($page, $key, $msg, $house_id = 0) {
@@ -19,6 +20,18 @@ function go($page, $key, $msg, $house_id = 0) {
     $idPart = $house_id ? "id=" . (int)$house_id . "&" : "";
     header("Location: $base_url/frontend/$page?{$idPart}$key=" . urlencode($msg));
     exit;
+}
+
+// Convert stored image_path into a URL usable from frontend/edit_house.html
+function eh_image_src($path) {
+    $path = trim((string)$path);
+    if ($path === '') {
+        return '';
+    }
+    if (preg_match('#^(data:image/|https?://)#i', $path)) {
+        return $path;
+    }
+    return '../uploads/' . rawurlencode(basename($path));
 }
 
 // Catch uploads that exceed PHP's post_max_size limit
@@ -46,9 +59,11 @@ if ($house_id <= 0) {
 }
 
 // 2. Fetch the house
-$stmt = $pdo->prepare("SELECT * FROM boarding_houses WHERE house_id = ?");
-$stmt->execute([$house_id]);
-$house = $stmt->fetch();
+$stmt = $conn->prepare("SELECT * FROM boarding_houses WHERE house_id = ?");
+$stmt->bind_param("i", $house_id);
+$stmt->execute();
+$house = $stmt->get_result()->fetch_assoc();
+$stmt->close();
 
 if (!$house) {
     echo '<div class="alert alert-error">Boarding house not found.</div>';
@@ -68,27 +83,26 @@ if ((int)$_SESSION['user_id'] !== (int)$house['owner_id'] && ($_SESSION['role'] 
 if (isset($_GET['delete_img'])) {
     $image_id = (int)$_GET['delete_img'];
 
-    // Prevent deleting the last remaining photo
-    $countStmt = $pdo->prepare("SELECT COUNT(*) FROM house_images WHERE house_id = ?");
-    $countStmt->execute([$house_id]);
-    if ((int)$countStmt->fetchColumn() <= 1) {
-        go('edit_house.html', 'err', "You must keep at least one photo. Upload a new photo before deleting this one.", $house_id);
-    }
-
     // Look up the file name first so we can also remove it from /uploads/
-    $imgStmt = $pdo->prepare("SELECT image_path FROM house_images WHERE image_id = ? AND house_id = ?");
-    $imgStmt->execute([$image_id, $house_id]);
-    $img = $imgStmt->fetch();
+    $imgStmt = $conn->prepare("SELECT image_path FROM house_images WHERE image_id = ? AND house_id = ?");
+    $imgStmt->bind_param("ii", $image_id, $house_id);
+    $imgStmt->execute();
+    $img = $imgStmt->get_result()->fetch_assoc();
+    $imgStmt->close();
 
     if ($img) {
-        $del = $pdo->prepare("DELETE FROM house_images WHERE image_id = ? AND house_id = ?");
-        $del->execute([$image_id, $house_id]);
+        $del = $conn->prepare("DELETE FROM house_images WHERE image_id = ? AND house_id = ?");
+        $del->bind_param("ii", $image_id, $house_id);
+        $del->execute();
+        $del->close();
 
-        $file = __DIR__ . '/../uploads/' . basename($img['image_path']);
-        if (is_file($file)) {
-            unlink($file);
+        if (!preg_match('#^(data:image/|https?://)#i', (string)$img['image_path'])) {
+            $file = __DIR__ . '/../uploads/' . basename($img['image_path']);
+            if (is_file($file)) {
+                @unlink($file);
+            }
         }
-        go('edit_house.html', 'msg', "Photo deleted.", $house_id);
+        go('edit_house.html', 'msg', "Photo deleted successfully.", $house_id);
     }
     go('edit_house.html', 'err', "Photo not found.", $house_id);
 }
@@ -125,17 +139,23 @@ if ($is_post) {
         go('edit_house.html', 'err', "Please select a valid gender type.", $house_id);
     }
 
+    $distanceVal = (float)$distance_km;
+    $rentVal     = (float)$monthly_rent;
+
     try {
-        $upd = $pdo->prepare(
+        $upd = $conn->prepare(
             "UPDATE boarding_houses
                 SET title = ?, address = ?, google_maps_link = ?, distance_km = ?,
                     monthly_rent = ?, gender_type = ?, amenities = ?, description = ?
               WHERE house_id = ?"
         );
-        $upd->execute([
-            $title, $address, $google_maps_link, $distance_km,
-            $monthly_rent, $gender_type, $amenities, $description, $house_id
-        ]);
+        $upd->bind_param(
+            "sssddsssi",
+            $title, $address, $google_maps_link, $distanceVal,
+            $rentVal, $gender_type, $amenities, $description, $house_id
+        );
+        $upd->execute();
+        $upd->close();
 
         // Optional: add a newly uploaded photo (field name "image" or "photo")
         $fileKey = isset($_FILES['image']) ? 'image' : (isset($_FILES['photo']) ? 'photo' : null);
@@ -161,7 +181,8 @@ if ($is_post) {
             if (!in_array($ext, $allowedExt, true) || !in_array($mime, $allowedMime, true)) {
                 go('edit_house.html', 'err', "Details saved, but the photo must be a JPG, PNG, GIF or WEBP image.", $house_id);
             }
-            if ($_FILES[$fileKey]['size'] > 5 * 1024 * 1024) {
+            // 5242880 bytes = 5 MB
+            if ($_FILES[$fileKey]['size'] > 5242880) {
                 go('edit_house.html', 'err', "Details saved, but the photo is too large (max 5 MB).", $house_id);
             }
 
@@ -174,8 +195,10 @@ if ($is_post) {
             $newFileName = time() . '_' . $safeName;
 
             if (move_uploaded_file($_FILES[$fileKey]['tmp_name'], $uploadDir . $newFileName)) {
-                $ins = $pdo->prepare("INSERT INTO house_images (house_id, image_path) VALUES (?, ?)");
-                $ins->execute([$house_id, $newFileName]);
+                $ins = $conn->prepare("INSERT INTO house_images (house_id, image_path) VALUES (?, ?)");
+                $ins->bind_param("is", $house_id, $newFileName);
+                $ins->execute();
+                $ins->close();
             } else {
                 go('edit_house.html', 'err', "Details saved, but the photo could not be moved to uploads.", $house_id);
             }
@@ -183,7 +206,7 @@ if ($is_post) {
 
         go('view_house.html', 'msg', "Listing updated successfully!", $house_id);
 
-    } catch (PDOException $e) {
+    } catch (Throwable $e) {
         error_log("Edit house error: " . $e->getMessage());
         go('edit_house.html', 'err', "Could not update the listing. Please try again.", $house_id);
     }
@@ -192,16 +215,18 @@ if ($is_post) {
 // 6. Otherwise (GET ?id=): output the pre-filled edit form HTML
 header('Content-Type: text/html; charset=UTF-8');
 
-$imgStmt = $pdo->prepare("SELECT image_id, image_path FROM house_images WHERE house_id = ? ORDER BY image_id ASC");
-$imgStmt->execute([$house_id]);
-$images = $imgStmt->fetchAll();
+$imgStmt = $conn->prepare("SELECT image_id, image_path FROM house_images WHERE house_id = ? ORDER BY image_id ASC");
+$imgStmt->bind_param("i", $house_id);
+$imgStmt->execute();
+$images = $imgStmt->get_result()->fetch_all(MYSQLI_ASSOC);
+$imgStmt->close();
 
 $all_amenities = ['WiFi', 'Attached Bathroom', 'AC', 'Parking', 'Furnished', 'Kitchen', 'Hot Water', 'CCTV', 'Laundry'];
 $selected      = array_filter(array_map('trim', explode(',', (string)$house['amenities'])));
 $e             = fn($v) => htmlspecialchars((string)$v, ENT_QUOTES, 'UTF-8');
 $cleanRent     = (float)$house['monthly_rent'];
 ?>
-<form action="<?= $e($base_url) ?>/backend/edit_house_process.php" method="POST" enctype="multipart/form-data">
+<form action="../backend/edit_house_process.php" method="POST" enctype="multipart/form-data">
     <input type="hidden" name="house_id" value="<?= (int)$house['house_id'] ?>">
 
     <div class="form-group">
@@ -264,11 +289,11 @@ $cleanRent     = (float)$house['monthly_rent'];
             <div style="display: flex; flex-wrap: wrap; gap: 12px; margin-top: 6px;">
                 <?php foreach ($images as $img): ?>
                     <div style="text-align:center;">
-                        <img src="<?= $e($base_url . '/uploads/' . rawurlencode(basename($img['image_path']))) ?>"
+                        <img src="<?= $e(eh_image_src($img['image_path'])) ?>"
                              alt="House photo" style="width:120px; height:90px; object-fit:cover; border-radius:6px;">
                         <br>
-                        <a href="<?= $e($base_url) ?>/backend/edit_house_process.php?delete_img=<?= (int)$img['image_id'] ?>&id=<?= (int)$house['house_id'] ?>"
-                           style="color:#dc2626; font-size:13px;"
+                        <a href="../backend/edit_house_process.php?delete_img=<?= (int)$img['image_id'] ?>&id=<?= (int)$house['house_id'] ?>"
+                           style="color:#dc2626; font-size:13px; font-weight:600; text-decoration:none;"
                            onclick="return confirm('Delete this photo?');">🗑 Delete</a>
                     </div>
                 <?php endforeach; ?>
