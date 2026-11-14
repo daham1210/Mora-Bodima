@@ -28,7 +28,7 @@
  * ============================================================================
  */
 
-require_once 'db.php';
+require_once '/config/db.php';
 
 // Escape any value before printing it inside HTML (prevents XSS)
 function adm_e($value)
