@@ -3,8 +3,8 @@
 
 
 $servername = "localhost";
-$username = "superuser";
-$password = "1234";
+$username = "root";
+$password = '';
 $dbname = "morabodima";
 
 // Create Connection to Bodim DB

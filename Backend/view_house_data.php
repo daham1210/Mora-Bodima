@@ -1,0 +1,645 @@
+<?php
+/**
+ * ============================================================================
+ *  MoraBodima — backend/view_house_data.php
+ *  File 17: House Details Reader & Review Submission Handler
+ * ============================================================================
+ *
+ *  This file does TWO jobs:
+ *
+ *   1. POST  (form submitted from the "Write a Review" card)
+ *      -> Saves the student's review into the `reviews` table
+ *         (a student can review a house once; submitting again UPDATES it)
+ *      -> Recalculates AVG(overall_rating) and COUNT(*) for the house
+ *      -> Saves the new numbers into `boarding_houses`
+ *      -> Redirects back to frontend/view_house.html?id=X&msg=...
+ *
+ *   2. GET   (called by app.js:  fetch('../backend/view_house_data.php?id=X'))
+ *      -> Runs the 3 main SELECT queries:
+ *           (a) boarding house JOIN users   (house details + owner name/email)
+ *           (b) house_images                (photo gallery)
+ *           (c) reviews JOIN users          (each review + reviewer name)
+ *      -> Echoes an HTML fragment that app.js injects into
+ *         <div id="houseDetailsContainer"> on frontend/view_house.html
+ *
+ *  IMPORTANT: This output is inserted with element.innerHTML, so <script> tags
+ *  would NOT run. That is why the star-rating picker is pure CSS (radio
+ *  buttons) and the gallery uses a small inline onclick="" attribute.
+ *
+ *  Key functions for the viva:
+ *    $pdo->prepare() + execute()  -> prevents SQL injection
+ *    AVG() / COUNT(*)             -> rating aggregation in MySQL
+ *    htmlspecialchars()           -> blocks XSS
+ *    nl2br()                      -> keeps line breaks in descriptions/reviews
+ *    beginTransaction()/commit()  -> review save + rating update happen together
+ * ============================================================================
+ */
+
+require_once 'db.php';
+
+/* ----------------------------------------------------------------------------
+ *  Small helper functions
+ * ------------------------------------------------------------------------- */
+
+// Escape any value before printing it inside HTML (prevents XSS)
+function vh_e($value)
+{
+    return htmlspecialchars((string)$value, ENT_QUOTES, 'UTF-8');
+}
+
+// Redirect the browser back to a frontend page and stop the script
+function vh_redirect($url)
+{
+    header("Location: $url");
+    exit;
+}
+
+// Convert a stored image_path into a URL usable from frontend/view_house.html
+//   "uploads/123_room.jpg"        -> "../uploads/123_room.jpg"
+//   "/Mora-Bodima/uploads/x.jpg"  -> unchanged (already absolute)
+//   "data:image/jpeg;base64,..."  -> unchanged (Base64 image)
+//   "https://..."                 -> unchanged (external image)
+function vh_image_src($path)
+{
+    $path = trim((string)$path);
+    if ($path === '') {
+        return '';
+    }
+    if (preg_match('#^(data:image/|https?://)#i', $path)) {
+        return $path;
+    }
+    if (strpos($path, '/uploads/') === 0) {
+        return '..' . $path;
+    }
+    if ($path[0] === '/') {
+        return $path;
+    }
+    return '../' . ltrim($path, './');
+}
+
+// Build a row of 5 stars, e.g. 3.6 -> ★★★★☆ (rounded to nearest whole star)
+function vh_stars($rating)
+{
+    $full = (int)round((float)$rating);
+    $html = '';
+    for ($i = 1; $i <= 5; $i++) {
+        $html .= $i <= $full ? '<span class="vh-star on">★</span>' : '<span class="vh-star">★</span>';
+    }
+    return $html;
+}
+
+// Map the gender_type column to a badge class + label
+function vh_gender_badge($gender)
+{
+    $g = strtolower(trim((string)$gender));
+    if (strpos($g, 'female') !== false || strpos($g, 'girl') !== false) {
+        return ['badge-female', '👩 Girls Only'];
+    }
+    if (strpos($g, 'male') !== false || strpos($g, 'boy') !== false) {
+        return ['badge-male', '👨 Boys Only'];
+    }
+    return ['badge-mixed', '👥 Mixed'];
+}
+
+// Clamp a posted star value to 1–5 (returns 0 if missing/invalid)
+function vh_rating_value($key)
+{
+    $v = isset($_POST[$key]) ? (int)$_POST[$key] : 0;
+    return ($v >= 1 && $v <= 5) ? $v : 0;
+}
+
+// Does the reviews table have the extra Cleanliness / Safety columns?
+// (Keeps this file working even if database.sql only has overall_rating.)
+$hasCategoryRatings = (bool)$pdo->query("SHOW COLUMNS FROM reviews LIKE 'cleanliness_rating'")->fetch()
+                   && (bool)$pdo->query("SHOW COLUMNS FROM reviews LIKE 'safety_rating'")->fetch();
+
+$isLoggedIn = isset($_SESSION['user_id']);
+$userId     = $isLoggedIn ? (int)$_SESSION['user_id'] : 0;
+$userRole   = $isLoggedIn ? ($_SESSION['role'] ?? '') : '';
+
+/* ============================================================================
+ *  PART 1 — POST: Save a review, then recalculate the house rating
+ * ========================================================================= */
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+
+    $house_id = isset($_POST['house_id']) ? (int)$_POST['house_id'] : 0;
+    $backUrl  = "../frontend/view_house.html?id=$house_id";
+
+    // 1) Must be logged in
+    if (!$isLoggedIn) {
+        vh_redirect("../frontend/login.html?err=" . urlencode("Please log in to write a review."));
+    }
+
+    // 2) The house must exist and be approved
+    $stmt = $pdo->prepare("SELECT house_id, owner_id, status FROM boarding_houses WHERE house_id = ?");
+    $stmt->execute([$house_id]);
+    $house = $stmt->fetch();
+
+    if (!$house || $house['status'] !== 'approved') {
+        vh_redirect("../frontend/index.html?err=" . urlencode("That boarding house is not available for reviews."));
+    }
+
+    // 3) Owners cannot rate their own boarding house
+    if ((int)$house['owner_id'] === $userId) {
+        vh_redirect($backUrl . "&err=" . urlencode("You cannot review your own boarding house."));
+    }
+
+    // 4) Read and validate the form values
+    $overall     = vh_rating_value('overall_rating');
+    $cleanliness = vh_rating_value('cleanliness_rating') ?: $overall;
+    $safety      = vh_rating_value('safety_rating') ?: $overall;
+    $comment     = trim($_POST['comment'] ?? '');
+
+    if ($overall === 0) {
+        vh_redirect($backUrl . "&err=" . urlencode("Please choose an overall star rating (1 to 5)."));
+    }
+    if (mb_strlen($comment) < 5) {
+        vh_redirect($backUrl . "&err=" . urlencode("Please write a short comment (at least 5 characters)."));
+    }
+    if (mb_strlen($comment) > 2000) {
+        $comment = mb_substr($comment, 0, 2000);
+    }
+
+    try {
+        $pdo->beginTransaction();
+
+        // 5) Has this user already reviewed this house?
+        $stmt = $pdo->prepare("SELECT review_id FROM reviews WHERE house_id = ? AND user_id = ? LIMIT 1");
+        $stmt->execute([$house_id, $userId]);
+        $existing = $stmt->fetch();
+
+        if ($existing) {
+            // UPDATE the existing review (one review per student per house)
+            if ($hasCategoryRatings) {
+                $stmt = $pdo->prepare("UPDATE reviews
+                                       SET overall_rating = ?, cleanliness_rating = ?, safety_rating = ?, comment = ?
+                                       WHERE review_id = ?");
+                $stmt->execute([$overall, $cleanliness, $safety, $comment, $existing['review_id']]);
+            } else {
+                $stmt = $pdo->prepare("UPDATE reviews SET overall_rating = ?, comment = ? WHERE review_id = ?");
+                $stmt->execute([$overall, $comment, $existing['review_id']]);
+            }
+            $message = "Your review has been updated. Thank you!";
+        } else {
+            // INSERT a brand-new review
+            if ($hasCategoryRatings) {
+                $stmt = $pdo->prepare("INSERT INTO reviews (house_id, user_id, overall_rating, cleanliness_rating, safety_rating, comment)
+                                       VALUES (?, ?, ?, ?, ?, ?)");
+                $stmt->execute([$house_id, $userId, $overall, $cleanliness, $safety, $comment]);
+            } else {
+                $stmt = $pdo->prepare("INSERT INTO reviews (house_id, user_id, overall_rating, comment) VALUES (?, ?, ?, ?)");
+                $stmt->execute([$house_id, $userId, $overall, $comment]);
+            }
+            $message = "Your review was posted successfully. Thank you!";
+        }
+
+        // 6) Recalculate the average rating and total number of reviews in MySQL
+        $stmt = $pdo->prepare("SELECT AVG(overall_rating) AS avg_r, COUNT(*) AS total_r FROM reviews WHERE house_id = ?");
+        $stmt->execute([$house_id]);
+        $stats = $stmt->fetch();
+
+        // 7) Save the new numbers on the boarding house row
+        $stmt = $pdo->prepare("UPDATE boarding_houses SET avg_rating = ?, total_reviews = ? WHERE house_id = ?");
+        $stmt->execute([round((float)($stats['avg_r'] ?? 0), 2), (int)$stats['total_r'], $house_id]);
+
+        $pdo->commit();
+    } catch (PDOException $e) {
+        if ($pdo->inTransaction()) {
+            $pdo->rollBack();
+        }
+        vh_redirect($backUrl . "&err=" . urlencode("Could not save your review. Please try again."));
+    }
+
+    vh_redirect($backUrl . "&msg=" . urlencode($message));
+}
+
+/* ============================================================================
+ *  PART 2 — GET: Output the house details, gallery, rating summary & reviews
+ * ========================================================================= */
+
+$house_id = isset($_GET['id']) ? (int)$_GET['id'] : 0;
+
+// Styles for this fragment. Everything is prefixed with "vh-" so it never
+// clashes with style.css. Colours follow the site theme:
+// navy #0f172a, royal blue #2563eb, white cards.
+?>
+<style>
+    .vh-wrap{color:#0f172a}
+    .vh-card{background:#fff;border-radius:16px;padding:26px 28px;box-shadow:0 10px 30px rgba(0,0,0,.25);margin-bottom:22px}
+    .vh-hero{background:linear-gradient(135deg,#2563eb 0%,#1d4ed8 100%);color:#fff;border-radius:16px;padding:30px 34px;box-shadow:0 12px 32px rgba(37,99,235,.28);margin-bottom:22px;display:flex;justify-content:space-between;gap:24px;flex-wrap:wrap;align-items:flex-start}
+    .vh-hero h1{font-size:30px;font-weight:800;line-height:1.2;margin-bottom:8px}
+    .vh-hero .vh-address{opacity:.92;font-size:16px}
+    .vh-hero-badges{display:flex;gap:8px;flex-wrap:wrap;margin-top:14px}
+    .vh-hero-right{text-align:right}
+    .vh-price{font-size:30px;font-weight:800}
+    .vh-price small{font-size:15px;font-weight:600;opacity:.85}
+    .vh-hero .vh-star{color:rgba(255,255,255,.35)} .vh-hero .vh-star.on{color:#fbbf24}
+    .vh-hero-rating{margin-top:6px;font-size:15px}
+    .vh-btn{display:inline-flex;align-items:center;gap:6px;border:none;border-radius:10px;padding:11px 18px;font-weight:700;font-size:15px;cursor:pointer;text-decoration:none;font-family:inherit;transition:transform .15s,box-shadow .15s,background .15s}
+    .vh-btn:hover{transform:translateY(-1px)}
+    .vh-btn-primary{background:#2563eb;color:#fff}.vh-btn-primary:hover{background:#1d4ed8;box-shadow:0 6px 16px rgba(37,99,235,.35)}
+    .vh-btn-light{background:#fff;color:#1d4ed8}.vh-btn-light:hover{box-shadow:0 6px 16px rgba(0,0,0,.2)}
+    .vh-btn-outline{background:#eff6ff;color:#1d4ed8;border:1px solid #bfdbfe}
+    .vh-btn-danger{background:#fee2e2;color:#b91c1c;padding:7px 12px;font-size:13px}.vh-btn-danger:hover{background:#fecaca}
+    .vh-badge{display:inline-block;padding:5px 12px;border-radius:999px;font-size:13px;font-weight:700}
+    .vh-badge.badge-male{background:#dbeafe;color:#1d4ed8}
+    .vh-badge.badge-female{background:#fce7f3;color:#be185d}
+    .vh-badge.badge-mixed{background:#ede9fe;color:#6d28d9}
+    .vh-badge.st-approved{background:#dcfce7;color:#166534}
+    .vh-badge.st-pending{background:#fef3c7;color:#92400e}
+    .vh-badge.st-rejected{background:#fee2e2;color:#991b1b}
+    .vh-notice{background:#fef3c7;color:#92400e;border:1px solid #fcd34d;border-radius:10px;padding:13px 16px;font-weight:600;margin-bottom:18px}
+    .vh-gallery{display:grid;grid-template-columns:1fr;gap:12px;margin-bottom:22px}
+    .vh-main-img{width:100%;height:420px;object-fit:cover;border-radius:16px;background:#1e293b;display:block;box-shadow:0 10px 30px rgba(0,0,0,.25)}
+    .vh-thumbs{display:flex;gap:10px;overflow-x:auto;padding-bottom:4px}
+    .vh-thumbs img{width:110px;height:76px;object-fit:cover;border-radius:10px;cursor:pointer;opacity:.75;border:2px solid transparent;transition:opacity .15s,border-color .15s;flex-shrink:0}
+    .vh-thumbs img:hover{opacity:1;border-color:#2563eb}
+    .vh-no-img{height:260px;border-radius:16px;background:#1e293b;border:2px dashed #334155;display:flex;flex-direction:column;align-items:center;justify-content:center;color:#94a3b8;font-weight:600;margin-bottom:22px}
+    .vh-no-img span{font-size:54px;margin-bottom:6px}
+    .vh-grid{display:grid;grid-template-columns:minmax(0,1.7fr) minmax(0,1fr);gap:22px;align-items:start}
+    .vh-card h3{font-size:19px;font-weight:800;margin-bottom:14px;color:#0f172a}
+    .vh-facts{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:12px;margin-bottom:22px}
+    .vh-fact{background:#f8fafc;border:1px solid #e2e8f0;border-radius:12px;padding:13px 14px}
+    .vh-fact-label{font-size:12px;font-weight:700;color:#64748b;text-transform:uppercase;letter-spacing:.04em}
+    .vh-fact-value{font-size:17px;font-weight:800;margin-top:3px}
+    .vh-desc{color:#334155;line-height:1.7;font-size:15px}
+    .vh-tags{display:flex;flex-wrap:wrap;gap:8px}
+    .vh-tag{background:#eff6ff;color:#1d4ed8;border:1px solid #bfdbfe;padding:6px 12px;border-radius:999px;font-size:13px;font-weight:600}
+    .vh-muted{color:#64748b;font-size:14px}
+    .vh-score{display:flex;align-items:center;gap:14px;margin-bottom:18px}
+    .vh-score-num{font-size:46px;font-weight:800;line-height:1}
+    .vh-star{color:#cbd5e1;font-size:18px}.vh-star.on{color:#f59e0b}
+    .vh-bar-row{margin-bottom:13px}
+    .vh-bar-top{display:flex;justify-content:space-between;font-size:14px;font-weight:700;margin-bottom:5px}
+    .vh-bar{height:9px;background:#e2e8f0;border-radius:999px;overflow:hidden}
+    .vh-bar-fill{height:100%;background:linear-gradient(90deg,#2563eb,#60a5fa);border-radius:999px}
+    .vh-owner{display:flex;align-items:center;gap:12px;margin-bottom:14px}
+    .vh-avatar{width:44px;height:44px;border-radius:50%;background:#2563eb;color:#fff;display:flex;align-items:center;justify-content:center;font-weight:800;font-size:18px;flex-shrink:0}
+    .vh-map{width:100%;height:320px;border:0;border-radius:12px;display:block;margin-bottom:14px}
+    .vh-section-title{color:#fff;font-size:26px;font-weight:800;margin:34px 0 16px;display:flex;align-items:center;gap:10px}
+    .vh-section-title .vh-count{background:#1e293b;color:#93c5fd;font-size:14px;padding:4px 11px;border-radius:999px}
+    .vh-form-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:16px;margin-bottom:18px}
+    .vh-label{display:block;font-weight:700;font-size:15px;margin-bottom:6px;color:#0f172a}
+    .vh-rate{display:inline-flex;flex-direction:row-reverse;justify-content:flex-end;position:relative}
+    .vh-rate input{position:absolute;opacity:0;width:1px;height:1px;left:0;bottom:0}
+    .vh-rate label{font-size:32px;color:#cbd5e1;cursor:pointer;padding:0 2px;line-height:1;transition:color .1s,transform .1s}
+    .vh-rate label:hover{transform:scale(1.12)}
+    .vh-rate input:checked ~ label{color:#f59e0b}
+    .vh-rate:hover input ~ label{color:#cbd5e1}
+    .vh-rate:hover input + label:hover,.vh-rate:hover label:hover ~ label{color:#f59e0b}
+    .vh-rate input:focus-visible + label{outline:2px solid #2563eb;outline-offset:2px;border-radius:4px}
+    .vh-textarea{width:100%;min-height:120px;border:1px solid #e2e8f0;background:#f8fafc;border-radius:10px;padding:13px 15px;font-size:15px;font-family:inherit;color:#0f172a;resize:vertical;margin-bottom:16px}
+    .vh-textarea:focus{outline:none;border-color:#2563eb;box-shadow:0 0 0 3px rgba(37,99,235,.15);background:#fff}
+    .vh-login-box{text-align:center;padding:10px 0}
+    .vh-login-box p{margin-bottom:14px;color:#475569}
+    .vh-review{border-top:1px solid #e2e8f0;padding:20px 0}
+    .vh-review:first-child{border-top:none;padding-top:0}
+    .vh-review:last-child{padding-bottom:0}
+    .vh-review-head{display:flex;justify-content:space-between;align-items:flex-start;gap:12px;flex-wrap:wrap;margin-bottom:10px}
+    .vh-review-who{display:flex;align-items:center;gap:12px}
+    .vh-review-name{font-weight:800}
+    .vh-you{background:#dbeafe;color:#1d4ed8;font-size:11px;font-weight:800;padding:2px 8px;border-radius:999px;margin-left:6px;vertical-align:middle}
+    .vh-chips{display:flex;gap:8px;flex-wrap:wrap;margin:8px 0 10px}
+    .vh-chip{background:#f1f5f9;color:#334155;font-size:12px;font-weight:700;padding:4px 10px;border-radius:8px}
+    .vh-review-text{color:#334155;line-height:1.65}
+    .vh-empty{text-align:center;padding:26px 10px;color:#64748b}
+    .vh-empty span{font-size:40px;display:block;margin-bottom:6px}
+    .vh-error-card{text-align:center;padding:44px 20px}
+    .vh-error-card span{font-size:50px;display:block;margin-bottom:10px}
+    .vh-error-card h2{font-size:24px;margin-bottom:8px}
+    .vh-error-card p{color:#64748b;margin-bottom:18px}
+    @media (max-width:860px){.vh-grid{grid-template-columns:1fr}.vh-hero-right{text-align:left}.vh-main-img{height:260px}.vh-hero h1{font-size:24px}}
+</style>
+<?php
+
+// Small function to print a friendly "not found" card and stop
+function vh_error_card($icon, $title, $text)
+{
+    echo '<div class="vh-wrap"><div class="vh-card vh-error-card"><span>' . $icon . '</span>'
+       . '<h2>' . vh_e($title) . '</h2><p>' . vh_e($text) . '</p>'
+       . '<a class="vh-btn vh-btn-primary" href="index.html">← Back to Search</a></div></div>';
+    exit;
+}
+
+if ($house_id <= 0) {
+    vh_error_card('🔎', 'No boarding house selected', 'Open a boarding house from the home page to see its details.');
+}
+
+/* ---------- Query (a): house details + owner name & email ---------- */
+$stmt = $pdo->prepare("SELECT b.*, u.full_name AS owner_name, u.email AS owner_email
+                       FROM boarding_houses b
+                       JOIN users u ON b.owner_id = u.user_id
+                       WHERE b.house_id = ?");
+$stmt->execute([$house_id]);
+$house = $stmt->fetch();
+
+if (!$house) {
+    vh_error_card('🏚️', 'Boarding house not found', 'This listing may have been removed by the owner or an administrator.');
+}
+
+$isOwner = $isLoggedIn && (int)$house['owner_id'] === $userId;
+$isAdmin = $userRole === 'admin';
+
+// Only approved listings are public. Owners and admins can still preview theirs.
+if ($house['status'] !== 'approved' && !$isOwner && !$isAdmin) {
+    vh_error_card('⏳', 'Listing not available', 'This boarding house is waiting for admin approval or has been rejected.');
+}
+
+/* ---------- Query (b): all photos for the gallery ---------- */
+$stmt = $pdo->prepare("SELECT image_id, image_path FROM house_images WHERE house_id = ? ORDER BY image_id ASC");
+$stmt->execute([$house_id]);
+$images = $stmt->fetchAll();
+
+/* ---------- Query (c): all reviews + reviewer names (newest first) ---------- */
+$stmt = $pdo->prepare("SELECT r.*, u.full_name AS reviewer_name, u.role AS reviewer_role
+                       FROM reviews r
+                       JOIN users u ON r.user_id = u.user_id
+                       WHERE r.house_id = ?
+                       ORDER BY r.created_at DESC, r.review_id DESC");
+$stmt->execute([$house_id]);
+$reviews = $stmt->fetchAll();
+
+/* ---------- Rating breakdown (category averages) ---------- */
+$avgSql = $hasCategoryRatings
+    ? "SELECT AVG(overall_rating) AS avg_overall, AVG(cleanliness_rating) AS avg_clean, AVG(safety_rating) AS avg_safety, COUNT(*) AS total FROM reviews WHERE house_id = ?"
+    : "SELECT AVG(overall_rating) AS avg_overall, COUNT(*) AS total FROM reviews WHERE house_id = ?";
+$stmt = $pdo->prepare($avgSql);
+$stmt->execute([$house_id]);
+$avg = $stmt->fetch();
+
+$avgOverall   = (float)($avg['avg_overall'] ?? 0);
+$totalReviews = (int)$avg['total'];
+$breakdown    = ['⭐ Overall Experience' => $avgOverall];
+if ($hasCategoryRatings) {
+    $breakdown['🧹 Cleanliness']     = (float)($avg['avg_clean'] ?? 0);
+    $breakdown['🔒 Safety & Security'] = (float)($avg['avg_safety'] ?? 0);
+}
+
+// The logged-in user's own review (to pre-fill the form if they review again)
+$myReview = null;
+foreach ($reviews as $r) {
+    if ($isLoggedIn && (int)$r['user_id'] === $userId) {
+        $myReview = $r;
+        break;
+    }
+}
+
+/* ---------- Amenities: "Wi-Fi, Parking" -> ['Wi-Fi', 'Parking'] ---------- */
+$amenities = array_filter(array_map('trim', explode(',', (string)$house['amenities'])));
+
+/* ---------- Google Map embed URL ---------- */
+$mapLink  = trim((string)$house['google_maps_link']);
+$embedUrl = '';
+if ($mapLink !== '' && preg_match('/src=["\']([^"\']+)["\']/i', $mapLink, $m)) {
+    $embedUrl = $m[1];                                   // owner pasted the full <iframe> code
+} elseif ($mapLink !== '' && (stripos($mapLink, 'output=embed') !== false || stripos($mapLink, '/maps/embed') !== false)) {
+    $embedUrl = $mapLink;                                // already an embed link
+}
+if ($embedUrl === '' || !preg_match('#^https://#i', $embedUrl)) {
+    $embedUrl = 'https://maps.google.com/maps?q=' . urlencode($house['address'] . ', Sri Lanka') . '&z=15&output=embed';
+}
+$openMapUrl = preg_match('#^https?://#i', $mapLink) && stripos($mapLink, '<iframe') === false
+    ? $mapLink
+    : 'https://www.google.com/maps/search/?api=1&query=' . urlencode($house['address'] . ', Sri Lanka');
+
+[$genderClass, $genderLabel] = vh_gender_badge($house['gender_type']);
+$status = (string)$house['status'];
+?>
+<div class="vh-wrap">
+
+    <?php if ($status !== 'approved'): ?>
+        <div class="vh-notice">
+            <?= $status === 'pending'
+                ? '⏳ This listing is pending admin approval. Only you and administrators can see it right now.'
+                : '⛔ This listing was rejected by an administrator and is hidden from students.' ?>
+        </div>
+    <?php endif; ?>
+
+    <!-- ===================== HEADER BANNER ===================== -->
+    <div class="vh-hero">
+        <div>
+            <h1><?= vh_e($house['title']) ?></h1>
+            <div class="vh-address">📍 <?= vh_e($house['address']) ?></div>
+            <div class="vh-hero-badges">
+                <span class="vh-badge <?= $genderClass ?>"><?= $genderLabel ?></span>
+                <span class="vh-badge" style="background:rgba(255,255,255,.18);color:#fff">🚶 <?= number_format((float)$house['distance_km'], 1) ?> km to campus</span>
+                <?php if ($isOwner || $isAdmin): ?>
+                    <span class="vh-badge st-<?= vh_e($status) ?>"><?= vh_e(ucfirst($status)) ?></span>
+                <?php endif; ?>
+            </div>
+        </div>
+        <div class="vh-hero-right">
+            <div class="vh-price">Rs. <?= number_format((float)$house['monthly_rent'], 2) ?> <small>/ month</small></div>
+            <div class="vh-hero-rating">
+                <?= vh_stars($avgOverall) ?>
+                <strong><?= number_format($avgOverall, 1) ?></strong>
+                (<?= $totalReviews ?> review<?= $totalReviews === 1 ? '' : 's' ?>)
+            </div>
+            <?php if ($isOwner || $isAdmin): ?>
+                <div style="margin-top:14px">
+                    <a class="vh-btn vh-btn-light" href="edit_house.html?id=<?= (int)$house['house_id'] ?>">✏️ Edit Listing</a>
+                </div>
+            <?php endif; ?>
+        </div>
+    </div>
+
+    <!-- ===================== PHOTO GALLERY ===================== -->
+    <?php if (count($images) > 0): ?>
+        <div class="vh-gallery">
+            <img id="vhMainImg" class="vh-main-img" src="<?= vh_e(vh_image_src($images[0]['image_path'])) ?>" alt="<?= vh_e($house['title']) ?> photo">
+            <?php if (count($images) > 1): ?>
+                <div class="vh-thumbs">
+                    <?php foreach ($images as $img): ?>
+                        <img src="<?= vh_e(vh_image_src($img['image_path'])) ?>" alt="Room photo"
+                             onclick="document.getElementById('vhMainImg').src=this.src">
+                    <?php endforeach; ?>
+                </div>
+            <?php endif; ?>
+        </div>
+    <?php else: ?>
+        <div class="vh-no-img"><span>🏠</span>No photos uploaded yet</div>
+    <?php endif; ?>
+
+    <!-- ===================== DETAILS + SIDEBAR ===================== -->
+    <div class="vh-grid">
+
+        <!-- Left column -->
+        <div>
+            <div class="vh-card">
+                <h3>🏡 About this Boarding House</h3>
+                <div class="vh-facts">
+                    <div class="vh-fact"><div class="vh-fact-label">Monthly Rent</div><div class="vh-fact-value">Rs. <?= number_format((float)$house['monthly_rent'], 2) ?></div></div>
+                    <div class="vh-fact"><div class="vh-fact-label">Distance</div><div class="vh-fact-value"><?= number_format((float)$house['distance_km'], 1) ?> km</div></div>
+                    <div class="vh-fact"><div class="vh-fact-label">Suitable For</div><div class="vh-fact-value"><?= vh_e(ucfirst((string)$house['gender_type'])) ?></div></div>
+                    <div class="vh-fact"><div class="vh-fact-label">Rating</div><div class="vh-fact-value">⭐ <?= number_format($avgOverall, 1) ?> / 5</div></div>
+                </div>
+                <div class="vh-desc">
+                    <?= trim((string)$house['description']) !== ''
+                        ? nl2br(vh_e($house['description']))
+                        : '<span class="vh-muted">The owner has not added a description yet.</span>' ?>
+                </div>
+            </div>
+
+            <div class="vh-card">
+                <h3>✨ Amenities</h3>
+                <?php if (count($amenities) > 0): ?>
+                    <div class="vh-tags">
+                        <?php foreach ($amenities as $a): ?>
+                            <span class="vh-tag">✓ <?= vh_e($a) ?></span>
+                        <?php endforeach; ?>
+                    </div>
+                <?php else: ?>
+                    <p class="vh-muted">No amenities listed.</p>
+                <?php endif; ?>
+            </div>
+
+            <div class="vh-card">
+                <h3>🗺️ Location</h3>
+                <iframe class="vh-map" src="<?= vh_e($embedUrl) ?>" loading="lazy" allowfullscreen
+                        referrerpolicy="no-referrer-when-downgrade" title="Map of <?= vh_e($house['title']) ?>"></iframe>
+                <a class="vh-btn vh-btn-outline" href="<?= vh_e($openMapUrl) ?>" target="_blank" rel="noopener">📍 Open in Google Maps</a>
+            </div>
+        </div>
+
+        <!-- Right column -->
+        <div>
+            <div class="vh-card">
+                <h3>📊 Rating Breakdown</h3>
+                <div class="vh-score">
+                    <div class="vh-score-num"><?= number_format($avgOverall, 1) ?></div>
+                    <div>
+                        <div><?= vh_stars($avgOverall) ?></div>
+                        <div class="vh-muted">Based on <?= $totalReviews ?> student review<?= $totalReviews === 1 ? '' : 's' ?></div>
+                    </div>
+                </div>
+                <?php foreach ($breakdown as $label => $score): ?>
+                    <div class="vh-bar-row">
+                        <div class="vh-bar-top"><span><?= $label ?></span><span><?= number_format($score, 1) ?></span></div>
+                        <div class="vh-bar"><div class="vh-bar-fill" style="width:<?= round(($score / 5) * 100) ?>%"></div></div>
+                    </div>
+                <?php endforeach; ?>
+            </div>
+
+            <div class="vh-card">
+                <h3>📞 Contact Owner</h3>
+                <div class="vh-owner">
+                    <div class="vh-avatar"><?= vh_e(mb_strtoupper(mb_substr((string)$house['owner_name'], 0, 1))) ?></div>
+                    <div>
+                        <div style="font-weight:800"><?= vh_e($house['owner_name']) ?></div>
+                        <div class="vh-muted"><?= vh_e($house['owner_email']) ?></div>
+                    </div>
+                </div>
+                <a class="vh-btn vh-btn-primary" style="width:100%;justify-content:center"
+                   href="mailto:<?= vh_e($house['owner_email']) ?>?subject=<?= rawurlencode('Enquiry about ' . $house['title'] . ' (MoraBodima)') ?>">✉️ Email Owner</a>
+            </div>
+        </div>
+    </div>
+
+    <!-- ===================== WRITE A REVIEW ===================== -->
+    <h2 class="vh-section-title">📝 <?= $myReview ? 'Update Your Review' : 'Write a Review' ?></h2>
+    <div class="vh-card">
+        <?php if (!$isLoggedIn): ?>
+            <div class="vh-login-box">
+                <p>Stayed here? Log in to share your experience with other students.</p>
+                <a class="vh-btn vh-btn-primary" href="login.html">Login / Register to Review</a>
+            </div>
+
+        <?php elseif ($isOwner): ?>
+            <p class="vh-muted">🏠 This is your listing, so you can't review it. Student reviews will appear below.</p>
+
+        <?php elseif ($status !== 'approved'): ?>
+            <p class="vh-muted">Reviews open once this listing is approved.</p>
+
+        <?php else: ?>
+            <?php
+            // Fields shown in the form. If the DB only has overall_rating, just show one.
+            $ratingFields = ['overall_rating' => 'Overall Experience'];
+            if ($hasCategoryRatings) {
+                $ratingFields['cleanliness_rating'] = 'Cleanliness';
+                $ratingFields['safety_rating']      = 'Safety & Security';
+            }
+            ?>
+            <form action="../backend/view_house_data.php" method="POST">
+                <input type="hidden" name="house_id" value="<?= (int)$house['house_id'] ?>">
+
+                <div class="vh-form-grid">
+                    <?php foreach ($ratingFields as $field => $label): ?>
+                        <?php $current = $myReview ? (int)($myReview[$field] ?? 0) : 0; ?>
+                        <div>
+                            <span class="vh-label"><?= $label ?></span>
+                            <!-- Stars are listed 5 → 1 and shown with row-reverse, so
+                                 "input:checked ~ label" highlights the chosen star and every star before it -->
+                            <div class="vh-rate">
+                                <?php for ($s = 5; $s >= 1; $s--): ?>
+                                    <input type="radio" id="<?= $field . $s ?>" name="<?= $field ?>" value="<?= $s ?>"
+                                        <?= $current === $s ? 'checked' : '' ?> required>
+                                    <label for="<?= $field . $s ?>" title="<?= $s ?> star<?= $s > 1 ? 's' : '' ?>">★</label>
+                                <?php endfor; ?>
+                            </div>
+                        </div>
+                    <?php endforeach; ?>
+                </div>
+
+                <label class="vh-label" for="vhComment">Your Review</label>
+                <textarea id="vhComment" class="vh-textarea" name="comment" required minlength="5" maxlength="2000"
+                          placeholder="How was the room, the owner, Wi-Fi, water, noise, safety at night...?"><?= $myReview ? vh_e($myReview['comment']) : '' ?></textarea>
+
+                <button type="submit" class="vh-btn vh-btn-primary"><?= $myReview ? '💾 Update Review' : '🚀 Post Review' ?></button>
+            </form>
+        <?php endif; ?>
+    </div>
+
+    <!-- ===================== STUDENT REVIEWS LIST ===================== -->
+    <h2 class="vh-section-title">💬 Student Reviews <span class="vh-count"><?= count($reviews) ?></span></h2>
+    <div class="vh-card">
+        <?php if (count($reviews) === 0): ?>
+            <div class="vh-empty"><span>🗨️</span>No reviews yet. Be the first to review this boarding house!</div>
+        <?php else: ?>
+            <?php foreach ($reviews as $r): ?>
+                <?php
+                $isMine    = $isLoggedIn && (int)$r['user_id'] === $userId;
+                $canDelete = $isMine || $isAdmin;
+                ?>
+                <div class="vh-review">
+                    <div class="vh-review-head">
+                        <div class="vh-review-who">
+                            <div class="vh-avatar"><?= vh_e(mb_strtoupper(mb_substr((string)$r['reviewer_name'], 0, 1))) ?></div>
+                            <div>
+                                <div class="vh-review-name">
+                                    <?= vh_e($r['reviewer_name']) ?>
+                                    <?php if ($isMine): ?><span class="vh-you">YOU</span><?php endif; ?>
+                                </div>
+                                <div class="vh-muted">
+                                    <?= vh_stars($r['overall_rating']) ?>
+                                    <?php if (!empty($r['created_at'])): ?>
+                                        · <?= vh_e(date('d M Y', strtotime($r['created_at']))) ?>
+                                    <?php endif; ?>
+                                </div>
+                            </div>
+                        </div>
+
+                        <?php if ($canDelete): ?>
+                            <form action="../backend/delete_review.php" method="POST"
+                                  onsubmit="return confirm('Delete this review? This cannot be undone.');">
+                                <input type="hidden" name="review_id" value="<?= (int)$r['review_id'] ?>">
+                                <input type="hidden" name="house_id" value="<?= (int)$house['house_id'] ?>">
+                                <button type="submit" class="vh-btn vh-btn-danger">🗑 Delete</button>
+                            </form>
+                        <?php endif; ?>
+                    </div>
+
+                    <?php if ($hasCategoryRatings): ?>
+                        <div class="vh-chips">
+                            <span class="vh-chip">⭐ Overall <?= (int)$r['overall_rating'] ?>/5</span>
+                            <span class="vh-chip">🧹 Cleanliness <?= (int)$r['cleanliness_rating'] ?>/5</span>
+                            <span class="vh-chip">🔒 Safety <?= (int)$r['safety_rating'] ?>/5</span>
+                        </div>
+                    <?php endif; ?>
+
+                    <div class="vh-review-text"><?= nl2br(vh_e($r['comment'])) ?></div>
+                </div>
+            <?php endforeach; ?>
+        <?php endif; ?>
+    </div>
+
+</div>

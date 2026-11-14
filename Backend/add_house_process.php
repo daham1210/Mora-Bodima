@@ -6,7 +6,7 @@ if (session_status() === PHP_SESSION_NONE) {
     session_start();
 }
 
-require_once 'db.php';
+require_once '/config/db.php';
 
 $base_url = $base_url ?? '..';
 
