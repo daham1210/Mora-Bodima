@@ -53,9 +53,15 @@ if (empty($houses)) {
 foreach ($houses as $house):
 ?>
     <div class="card" style="overflow: hidden;">
-        <?php if (!empty($house['cover_image'])): ?>
-            <div style="overflow: hidden; border-radius: 8px; margin-bottom: 16px;">
-                <img src="<?= $house['cover_image'] ?>" class="card-img" alt="Boarding Image">
+        <?php
+        $rawImg = trim((string)($house['cover_image'] ?? ''));
+        $imgSrc = preg_match('#^(data:image/|https?://|\.\./)#i', $rawImg)
+            ? $rawImg
+            : '../uploads/' . rawurlencode(basename($rawImg));
+        ?>
+        <?php if ($rawImg !== ''): ?>
+            <div class="card-img-wrap" style="overflow: hidden; border-radius: 8px; margin-bottom: 16px;">
+                <img src="<?= htmlspecialchars($imgSrc, ENT_QUOTES, 'UTF-8') ?>" class="card-img" alt="Boarding Image">
             </div>
         <?php else: ?>
             <div class="card-img" style="display:flex;align-items:center;justify-content:center;color:#475569;font-weight:600;">
