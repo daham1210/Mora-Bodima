@@ -1,5 +1,4 @@
 document.addEventListener('DOMContentLoaded', function () {
-    // 1. Load the dynamic Navigation Bar on every page
     const navLinks = document.getElementById('navLinks');
     if (navLinks) {
         fetch('../backend/navbar.php')
@@ -7,7 +6,6 @@ document.addEventListener('DOMContentLoaded', function () {
             .then(html => { navLinks.innerHTML = html; });
     }
 
-    // 2. Show alert message if URL has ?msg= or ?err=
     const urlParams = new URLSearchParams(window.location.search);
     const alertBox = document.getElementById('alertBox');
     if (alertBox) {
@@ -18,7 +16,6 @@ document.addEventListener('DOMContentLoaded', function () {
         }
     }
 
-    //3. Home & Search Page: Load and filter boarding houses
     const filterForm = document.getElementById('searchFilterForm');
     const resultsContainer = document.getElementById('searchResults');
     if (filterForm && resultsContainer) {
@@ -36,7 +33,6 @@ document.addEventListener('DOMContentLoaded', function () {
         loadHouses();
     }
 
-    // 4. View House Details Page: Load house details and reviews
     const houseDetailsContainer = document.getElementById('houseDetailsContainer');
     if (houseDetailsContainer) {
         const houseId = urlParams.get('id') || 0;
@@ -45,7 +41,6 @@ document.addEventListener('DOMContentLoaded', function () {
             .then(html => { houseDetailsContainer.innerHTML = html; });
     }
 
-    // 5. Edit House Page: Load existing house values into the edit form
     const editHouseContainer = document.getElementById('editHouseContainer');
     if (editHouseContainer) {
         const houseId = urlParams.get('id') || 0;
@@ -54,7 +49,6 @@ document.addEventListener('DOMContentLoaded', function () {
             .then(html => { editHouseContainer.innerHTML = html; });
     }
 
-    // 6. Admin Page: Load dashboard statistics and table
     const adminContainer = document.getElementById('adminContainer');
     if (adminContainer) {
         fetch('../backend/admin_process.php')
@@ -62,7 +56,6 @@ document.addEventListener('DOMContentLoaded', function () {
             .then(html => { adminContainer.innerHTML = html; });
     }
 
-    // 7. Load User Profile Page (profile.html)
     const profileContainer = document.getElementById('profileContainer');
     if (profileContainer) {
         fetch('../backend/profile_process.php')
