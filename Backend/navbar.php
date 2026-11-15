@@ -13,9 +13,9 @@ require_once __DIR__ . '/config/db_con.php';
         <a href="admin.html">Admin Panel</a>
     <?php endif; ?>
 
-    <span class="user-pill">
+    <a href="profile.html" class="user-pill" title="View & Edit Profile">
         👤 <?= htmlspecialchars($_SESSION['full_name']) ?> (<?= ucfirst($_SESSION['role']) ?>)
-    </span>
+    </a>
     <a href="../backend/login.php?logout=1" class="btn-logout">Logout</a>
 <?php else: ?>
     <a href="login.html" class="btn-nav">Login / Register</a>

@@ -61,4 +61,17 @@ document.addEventListener('DOMContentLoaded', function () {
             .then(res => res.text())
             .then(html => { adminContainer.innerHTML = html; });
     }
+
+    // 7. Load User Profile Page (profile.html)
+    const profileContainer = document.getElementById('profileContainer');
+    if (profileContainer) {
+        fetch('../backend/profile_process.php')
+            .then(res => res.text())
+            .then(html => {
+                profileContainer.innerHTML = html;
+            })
+            .catch(() => {
+                profileContainer.innerHTML = '<div class="alert alert-error">Failed to load profile.</div>';
+            });
+    }
 });
