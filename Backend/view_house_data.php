@@ -1,6 +1,4 @@
 <?php
-// backend/view_house_data.php
-// House Details Reader (GET) & Review Submission Handler (POST)
 
 require_once __DIR__ . '/config/db_con.php';
 
@@ -79,7 +77,6 @@ $isLoggedIn = isset($_SESSION['user_id']);
 $userId     = $isLoggedIn ? (int)$_SESSION['user_id'] : 0;
 $userRole   = $isLoggedIn ? ($_SESSION['role'] ?? '') : '';
 
-// PART 1: POST — Save or update a review
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     $house_id = isset($_POST['house_id']) ? (int)$_POST['house_id'] : 0;
     $backUrl  = "../frontend/view_house.html?id=$house_id";
@@ -178,14 +175,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     vh_redirect($backUrl . "&msg=" . urlencode($message));
 }
 
-// PART 2: GET — Output house details, gallery, rating summary & reviews
 $house_id = isset($_GET['id']) ? (int)$_GET['id'] : 0;
 
 if ($house_id <= 0) {
     vh_error_card('🔎', 'No boarding house selected', 'Open a boarding house from the home page to see its details.');
 }
 
-// 1. House details + owner info
 $stmt = $conn->prepare("SELECT b.*, u.name AS owner_name, u.email AS owner_email
                         FROM boarding_houses b
                         JOIN users u ON b.owner_id = u.user_id
@@ -206,7 +201,6 @@ if ($house['status'] !== 'approved' && !$isOwner && !$isAdmin) {
     vh_error_card('⏳', 'Listing not available', 'This boarding house is waiting for admin approval or has been rejected.');
 }
 
-// 2. Gallery photos
 $stmt = $conn->prepare("SELECT image_id, image_path FROM house_images WHERE house_id = ? ORDER BY image_id ASC");
 $stmt->bind_param("i", $house_id);
 $stmt->execute();
@@ -215,7 +209,6 @@ $stmt->close();
 
 $images = array_values(array_filter($rawImages, fn($img) => vh_image_exists($img['image_path'])));
 
-// 3. Reviews list
 $stmt = $conn->prepare("SELECT r.*, u.name AS reviewer_name, u.role AS reviewer_role
                         FROM reviews r
                         JOIN users u ON r.user_id = u.user_id
@@ -226,7 +219,6 @@ $stmt->execute();
 $reviews = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
 $stmt->close();
 
-// 4. Rating averages
 $avgSql = $hasCategoryRatings
     ? "SELECT AVG(overall_rating) AS avg_overall, AVG(cleanliness_rating) AS avg_clean, AVG(safety_rating) AS avg_safety, COUNT(*) AS total FROM reviews WHERE house_id = ?"
     : "SELECT AVG(overall_rating) AS avg_overall, COUNT(*) AS total FROM reviews WHERE house_id = ?";
@@ -280,8 +272,6 @@ $status = (string)$house['status'];
                 : '⛔ This listing was rejected by an administrator and is hidden from students.' ?>
         </div>
     <?php endif; ?>
-
-    <!-- Header Banner -->
     <div class="vh-hero">
         <div>
             <h1><?= vh_e($house['title']) ?></h1>
@@ -308,8 +298,6 @@ $status = (string)$house['status'];
             <?php endif; ?>
         </div>
     </div>
-
-    <!-- Photo Gallery -->
     <?php if (count($images) > 0): ?>
         <div class="vh-gallery">
             <img id="vhMainImg" class="vh-main-img" src="<?= vh_e(vh_image_src($images[0]['image_path'])) ?>" alt="<?= vh_e($house['title']) ?> photo">
@@ -325,8 +313,6 @@ $status = (string)$house['status'];
     <?php else: ?>
         <div class="vh-no-img"><span>🏠</span>No photos uploaded yet</div>
     <?php endif; ?>
-
-    <!-- Details + Sidebar -->
     <div class="vh-grid">
         <div>
             <div class="vh-card">
@@ -397,8 +383,6 @@ $status = (string)$house['status'];
             </div>
         </div>
     </div>
-
-    <!-- Write a Review -->
     <h2 class="vh-section-title">📝 <?= $myReview ? 'Update Your Review' : 'Write a Review' ?></h2>
     <div class="vh-card">
         <?php if (!$isLoggedIn): ?>
@@ -445,8 +429,6 @@ $status = (string)$house['status'];
             </form>
         <?php endif; ?>
     </div>
-
-    <!-- Student Reviews List -->
     <h2 class="vh-section-title">💬 Student Reviews <span class="vh-count"><?= count($reviews) ?></span></h2>
     <div class="vh-card">
         <?php if (count($reviews) === 0): ?>

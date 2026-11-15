@@ -1,7 +1,4 @@
 <?php
-// backend/profile_process.php
-// View & Update User Profile Controller (MySQLi)
-
 require_once __DIR__ . '/config/db_con.php';
 
 if (session_status() === PHP_SESSION_NONE) {
@@ -17,7 +14,6 @@ function pf_redirect($type, $msg) {
     exit;
 }
 
-// Check login status
 if (!isset($_SESSION['user_id'])) {
     if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         header("Location: ../frontend/login.html?err=" . urlencode("Please log in to edit your profile."));
@@ -34,7 +30,6 @@ if (!isset($_SESSION['user_id'])) {
 
 $user_id = (int)$_SESSION['user_id'];
 
-// Fetch current user record
 $stmt = $conn->prepare("SELECT user_id, name, email, pass, role FROM users WHERE user_id = ?");
 $stmt->bind_param("i", $user_id);
 $stmt->execute();
@@ -46,9 +41,6 @@ if (!$user) {
     exit;
 }
 
-/* ============================================================================
- * PART 1 — POST: Update Name, Email, or Password
- * ========================================================================= */
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     $full_name        = trim($_POST['full_name'] ?? '');
     $email            = trim($_POST['email'] ?? '');
@@ -63,7 +55,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         pf_redirect('err', "Please enter a valid email address.");
     }
 
-    // Check if another user already uses this email
     $chk = $conn->prepare("SELECT user_id FROM users WHERE email = ? AND user_id != ?");
     $chk->bind_param("si", $email, $user_id);
     $chk->execute();
@@ -74,7 +65,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         pf_redirect('err', "That email address is already taken by another account.");
     }
 
-    // If the user typed a new password, verify current password first
     if ($new_password !== '') {
         if (mb_strlen($new_password) < 4) {
             pf_redirect('err', "New password must be at least 4 characters long.");
@@ -98,7 +88,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
     if ($upd->execute()) {
         $upd->close();
-        // Update session so navbar reflects new name immediately
         $_SESSION['full_name'] = $full_name;
         pf_redirect('msg', "Profile updated successfully!");
     } else {
@@ -107,11 +96,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     }
 }
 
-/* ============================================================================
- * PART 2 — GET: Display Profile Overview, Edit Form & User Activity
- * ========================================================================= */
-
-// Fetch user's boarding houses (if Owner or Admin)
 $myHouses = [];
 if (in_array($user['role'], ['owner', 'admin'], true)) {
     $hStmt = $conn->prepare("SELECT house_id, title, address, monthly_rent, status, avg_rating, total_reviews
@@ -122,7 +106,6 @@ if (in_array($user['role'], ['owner', 'admin'], true)) {
     $hStmt->close();
 }
 
-// Fetch user's reviews
 $rStmt = $conn->prepare("SELECT r.review_id, r.house_id, r.overall_rating, r.comment, r.created_at, b.title AS house_title
                          FROM reviews r
                          JOIN boarding_houses b ON r.house_id = b.house_id
@@ -137,8 +120,6 @@ $initial = mb_strtoupper(mb_substr($user['name'], 0, 1));
 ?>
 
 <div class="vh-wrap">
-
-    <!-- Profile Hero Banner -->
     <div class="vh-hero">
         <div style="display: flex; align-items: center; gap: 20px; flex-wrap: wrap;">
             <div class="vh-avatar" style="width: 72px; height: 72px; font-size: 28px; border: 3px solid rgba(255,255,255,0.4);">
@@ -163,8 +144,6 @@ $initial = mb_strtoupper(mb_substr($user['name'], 0, 1));
     </div>
 
     <div class="vh-grid">
-
-        <!-- Left Column: Edit Profile & Password Form -->
         <div>
             <div class="vh-card">
                 <h3>✏️ Modify Profile Details</h3>
@@ -208,8 +187,6 @@ $initial = mb_strtoupper(mb_substr($user['name'], 0, 1));
                 </form>
             </div>
         </div>
-
-        <!-- Right Column: Quick Summary & Activity -->
         <div>
             <?php if (in_array($user['role'], ['owner', 'admin'], true)): ?>
                 <div class="vh-card">

@@ -1,9 +1,4 @@
 <?php
-// backend/edit_house_process.php
-// Update Listing & Delete Photo Handler (MySQLi)
-//   GET  ?id=X                      -> outputs the pre-filled edit form (fetched by app.js)
-//   GET  ?delete_img=Y&id=X         -> deletes one photo, redirects back to edit_house.html
-//   POST (hidden house_id + fields) -> updates listing, adds new photo, redirects to view_house.html
 
 if (session_status() === PHP_SESSION_NONE) {
     session_start();
@@ -11,10 +6,8 @@ if (session_status() === PHP_SESSION_NONE) {
 
 require_once __DIR__ . '/config/db_con.php';
 
-// Always use relative path '..' so subfolder names like "Web Project" never break links
 $base_url = '..';
 
-// Redirect helper (used by delete / update actions)
 function go($page, $key, $msg, $house_id = 0) {
     global $base_url;
     $idPart = $house_id ? "id=" . (int)$house_id . "&" : "";
@@ -22,7 +15,6 @@ function go($page, $key, $msg, $house_id = 0) {
     exit;
 }
 
-// Convert stored image_path into a URL usable from frontend/edit_house.html
 function eh_image_src($path) {
     $path = trim((string)$path);
     if ($path === '') {
@@ -34,12 +26,10 @@ function eh_image_src($path) {
     return '../uploads/' . rawurlencode(basename($path));
 }
 
-// Catch uploads that exceed PHP's post_max_size limit
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && empty($_POST) && empty($_FILES) && ($_SERVER['CONTENT_LENGTH'] ?? 0) > 0) {
     go('index.html', 'err', "Uploaded file exceeds the server's maximum size limit.");
 }
 
-// Must be logged in
 if (!isset($_SESSION['user_id'])) {
     if ($_SERVER['REQUEST_METHOD'] === 'GET' && !isset($_GET['delete_img'])) {
         echo '<div class="alert alert-error">Please log in to edit a boarding house.</div>';
@@ -49,7 +39,6 @@ if (!isset($_SESSION['user_id'])) {
     exit;
 }
 
-// 1. Determine which house we are working on
 $is_post  = ($_SERVER['REQUEST_METHOD'] === 'POST');
 $house_id = $is_post ? (int)($_POST['house_id'] ?? 0) : (int)($_GET['id'] ?? 0);
 
@@ -58,7 +47,6 @@ if ($house_id <= 0) {
     exit;
 }
 
-// 2. Fetch the house
 $stmt = $conn->prepare("SELECT * FROM boarding_houses WHERE house_id = ?");
 $stmt->bind_param("i", $house_id);
 $stmt->execute();
@@ -70,7 +58,6 @@ if (!$house) {
     exit;
 }
 
-// 3. Ownership authorization: owner of this house OR admin
 if ((int)$_SESSION['user_id'] !== (int)$house['owner_id'] && ($_SESSION['role'] ?? '') !== 'admin') {
     if ($is_post || isset($_GET['delete_img'])) {
         go('index.html', 'err', "You are not allowed to edit this listing.");
@@ -79,11 +66,9 @@ if ((int)$_SESSION['user_id'] !== (int)$house['owner_id'] && ($_SESSION['role'] 
     exit;
 }
 
-// 4. DELETE a single photo (GET ?delete_img=IMAGE_ID&id=HOUSE_ID)
 if (isset($_GET['delete_img'])) {
     $image_id = (int)$_GET['delete_img'];
 
-    // Look up the file name first so we can also remove it from /uploads/
     $imgStmt = $conn->prepare("SELECT image_path FROM house_images WHERE image_id = ? AND house_id = ?");
     $imgStmt->bind_param("ii", $image_id, $house_id);
     $imgStmt->execute();
@@ -107,7 +92,6 @@ if (isset($_GET['delete_img'])) {
     go('edit_house.html', 'err', "Photo not found.", $house_id);
 }
 
-// 5. UPDATE the listing (POST)
 if ($is_post) {
     $title            = trim($_POST['title'] ?? '');
     $address          = trim($_POST['address'] ?? '');
@@ -120,7 +104,6 @@ if ($is_post) {
     $amenities_arr = isset($_POST['amenities']) && is_array($_POST['amenities']) ? $_POST['amenities'] : [];
     $amenities     = implode(',', array_filter(array_map('trim', $amenities_arr)));
 
-    // Validation
     if ($title === '' || $address === '') {
         go('edit_house.html', 'err', "Title and address are required.", $house_id);
     }
@@ -157,7 +140,6 @@ if ($is_post) {
         $upd->execute();
         $upd->close();
 
-        // Optional: add a newly uploaded photo (field name "image" or "photo")
         $fileKey = isset($_FILES['image']) ? 'image' : (isset($_FILES['photo']) ? 'photo' : null);
 
         if ($fileKey !== null && $_FILES[$fileKey]['error'] !== UPLOAD_ERR_NO_FILE) {
@@ -181,7 +163,7 @@ if ($is_post) {
             if (!in_array($ext, $allowedExt, true) || !in_array($mime, $allowedMime, true)) {
                 go('edit_house.html', 'err', "Details saved, but the photo must be a JPG, PNG, GIF or WEBP image.", $house_id);
             }
-            // 5242880 bytes = 5 MB
+
             if ($_FILES[$fileKey]['size'] > 5242880) {
                 go('edit_house.html', 'err', "Details saved, but the photo is too large (max 5 MB).", $house_id);
             }
@@ -212,7 +194,6 @@ if ($is_post) {
     }
 }
 
-// 6. Otherwise (GET ?id=): output the pre-filled edit form HTML
 header('Content-Type: text/html; charset=UTF-8');
 
 $imgStmt = $conn->prepare("SELECT image_id, image_path FROM house_images WHERE house_id = ? ORDER BY image_id ASC");

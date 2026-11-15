@@ -1,7 +1,6 @@
 <?php
 require_once __DIR__ . '/config/db_con.php';
 
-// 1. Handle Logout
 if (isset($_GET['logout'])) {
     session_destroy();
     header("Location: ../frontend/index.html?msg=Logged+out+successfully");
@@ -11,12 +10,10 @@ if (isset($_GET['logout'])) {
 if ($_SERVER['REQUEST_METHOD'] == 'POST') {
     $action = $_POST['action'] ?? '';
 
-    // 2. Handle Login
     if ($action == 'login') {
         $email    = trim($_POST['email'] ?? '');
         $password = trim($_POST['password'] ?? '');
 
-        // 1. Use MySQLi syntax (bind_param -> execute -> get_result -> fetch_assoc)
         $stmt = $conn->prepare("SELECT * FROM users WHERE email = ?");
         $stmt->bind_param("s", $email);
         $stmt->execute();
@@ -24,7 +21,6 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
         $user   = $result->fetch_assoc();
         $stmt->close();
 
-        // 2. Match exact column names from your SQL table: 'User', 'name', 'pass', 'role'
         if ($user && (password_verify($password, $user['pass']) || $password === $user['pass'])) {
             $_SESSION['user_id']   = $user['user_id']; // Capital 'U' to match your table!
             $_SESSION['full_name'] = $user['name'];
@@ -37,7 +33,7 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
             exit;
         }
     }
-    // 3. Handle Registration
+    
     if ($action == 'register') {
         $full_name = trim($_POST['full_name']);
         $email     = trim($_POST['email']);
