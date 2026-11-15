@@ -1,6 +1,4 @@
 <?php
-// backend/admin_process.php
-// Admin Moderation & Metrics Controller (MySQLi)
 
 require_once __DIR__ . '/config/db_con.php';
 
@@ -19,7 +17,6 @@ function adm_redirect($type, $text)
     exit;
 }
 
-// Helper: run a COUNT(*) query and return the integer result
 function adm_count($conn, $sql)
 {
     $res = $conn->query($sql);
@@ -27,7 +24,6 @@ function adm_count($conn, $sql)
     return (int)($row[0] ?? 0);
 }
 
-// Helper: return key => value pairs from a 2-column GROUP BY query
 function adm_key_pair($conn, $sql)
 {
     $pairs = [];
@@ -41,9 +37,6 @@ function adm_key_pair($conn, $sql)
 
 $isAdmin = isset($_SESSION['user_id']) && ($_SESSION['role'] ?? '') === 'admin';
 
-/* ============================================================================
- *  PART 1 — POST: Approve, reject or delete a listing
- * ========================================================================= */
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
     if (!$isAdmin) {
@@ -54,7 +47,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     $house_id = isset($_POST['house_id']) ? (int)$_POST['house_id'] : 0;
     $action   = $_POST['action'] ?? '';
 
-    // Make sure the listing exists before changing it
     $stmt = $conn->prepare("SELECT house_id FROM boarding_houses WHERE house_id = ?");
     $stmt->bind_param("i", $house_id);
     $stmt->execute();
@@ -74,7 +66,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             adm_redirect('msg', "Listing #$house_id has been " . $action . ".");
 
         } elseif ($action === 'delete') {
-            // Remove uploaded image files from disk before deleting the house row
             $imgStmt = $conn->prepare("SELECT image_path FROM house_images WHERE house_id = ?");
             $imgStmt->bind_param("i", $house_id);
             $imgStmt->execute();
@@ -91,7 +82,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 }
             }
 
-            // ON DELETE CASCADE removes its house_images and reviews rows automatically
             $stmt = $conn->prepare("DELETE FROM boarding_houses WHERE house_id = ?");
             $stmt->bind_param("i", $house_id);
             $stmt->execute();
@@ -106,9 +96,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     }
 }
 
-/* ============================================================================
- *  PART 2 — GET: Dashboard (KPI cards + moderation table)
- * ========================================================================= */
 
 if (!$isAdmin) {
     echo '<div style="background:#fff;border-radius:16px;padding:44px 20px;text-align:center;color:#0f172a;box-shadow:0 10px 30px rgba(0,0,0,.25)">'
@@ -120,7 +107,6 @@ if (!$isAdmin) {
     exit;
 }
 
-/* ---------- Summary metrics ---------- */
 $totalUsers   = adm_count($conn, "SELECT COUNT(*) FROM users");
 $totalHouses  = adm_count($conn, "SELECT COUNT(*) FROM boarding_houses");
 $totalReviews = adm_count($conn, "SELECT COUNT(*) FROM reviews");
@@ -129,7 +115,6 @@ $statusCounts = adm_key_pair($conn, "SELECT status, COUNT(*) FROM boarding_house
 $roleCounts   = adm_key_pair($conn, "SELECT role, COUNT(*) FROM users GROUP BY role");
 $pendingCount = (int)($statusCounts['pending'] ?? 0);
 
-/* ---------- All boarding houses + owner details (pending ones first) ---------- */
 $resHouses = $conn->query("SELECT b.house_id, b.title, b.address, b.monthly_rent, b.gender_type,
                                   b.avg_rating, b.total_reviews, b.status,
                                   u.name AS owner_name, u.email AS owner_email
@@ -185,13 +170,11 @@ $houses = $resHouses ? $resHouses->fetch_all(MYSQLI_ASSOC) : [];
 
 <div class="adm-wrap">
 
-    <!-- ===================== HEADER BANNER ===================== -->
     <div class="adm-hero">
         <h1>🛡️ Admin Moderation Dashboard</h1>
         <p>Review new boarding house submissions, approve or reject listings, and keep MoraBodima trustworthy for students.</p>
     </div>
 
-    <!-- ===================== 3 KPI SUMMARY CARDS ===================== -->
     <div class="adm-kpis">
         <div class="adm-kpi">
             <div class="adm-kpi-icon" style="background:#dbeafe">👥</div>
@@ -232,7 +215,6 @@ $houses = $resHouses ? $resHouses->fetch_all(MYSQLI_ASSOC) : [];
         </div>
     </div>
 
-    <!-- ===================== MODERATION TABLE ===================== -->
     <h2 class="adm-section-title">
         📋 Manage Boarding Listings
         <?php if ($pendingCount > 0): ?>
